@@ -4,3 +4,5 @@ thats all then you can start the monitor setup creds and go...
 
 known issues:
 laggy interface/traymenue
+
+tested: win11 only (should be run under Wine (Linux)
