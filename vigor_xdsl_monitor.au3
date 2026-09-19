@@ -12,15 +12,7 @@
 #Tidy_Parameters=/rel
 #AutoIt3Wrapper_Run_Au3Stripper=y
 #Au3Stripper_Parameters=/so /rm
-#EndRegion ;**** Directives created by AutoIt3Wrapper_GUI ****
 #include-once
-; Vigor167 DSL Monitor
-; Reads the DSL line status of a DrayTek Vigor167 via SSH (plink.exe) and publishes it
-; to Home Assistant via MQTT discovery. Settings are edited from the tray menu and
-; stored in vigor167-dsl.ini next to the script (plain text - do not commit it!).
-;
-; Requirements: plink.exe (PuTTY), an MQTT broker, the Home Assistant MQTT integration.
-; First use: run "plink.exe -ssh <user>@<modem-ip>" once by hand and accept the host key.
 #include <AutoItConstants.au3>
 #include <TrayConstants.au3>
 #include <GUIConstantsEx.au3>
@@ -30,7 +22,7 @@
 #include <WindowsConstants.au3>
 #include <MsgBoxConstants.au3>
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
-Global Const $APP_NAME = "Vigor xDSL Monitor"
+Global Const $APP_NAME = "Vigor167 DSL Monitor"
 Global Const $INI_FILE = @ScriptDir & "\vigor167-dsl.ini"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 Global Const $RUN_NAME = "Vigor167DslMonitor"
@@ -117,7 +109,8 @@ Func _LoadSettings()
 	$g_iMqttPort = Int(IniRead($INI_FILE, "mqtt", "port", "1883"))
 	$g_sMqttUser = IniRead($INI_FILE, "mqtt", "user", "")
 	$g_sMqttPass = IniRead($INI_FILE, "mqtt", "pass", "")
-	$g_iInterval = Max(15, Int(IniRead($INI_FILE, "general", "interval", "60")))
+	$g_iInterval = Int(IniRead($INI_FILE, "general", "interval", "60"))
+	If $g_iInterval < 15 Then $g_iInterval = 15 ; do not hammer the modem
 EndFunc   ;==>_LoadSettings
 Func _AutostartGet()
 	Return RegRead($RUN_KEY, $RUN_NAME) <> ""
@@ -202,7 +195,8 @@ Func _SettingsGui()
 					MsgBox($MB_ICONWARNING, "Settings", "Modem host and MQTT host are required.", 0, $hGui)
 					ContinueLoop
 				EndIf
-				$iInterval = Max(15, Int(GUICtrlRead($iInt)))
+				$iInterval = Int(GUICtrlRead($iInt))
+				If $iInterval < 15 Then $iInterval = 15
 				IniWrite($INI_FILE, "modem", "host", StringStripWS(GUICtrlRead($iHost), 3))
 				IniWrite($INI_FILE, "modem", "user", GUICtrlRead($iUser))
 				IniWrite($INI_FILE, "modem", "pass", GUICtrlRead($iPass))
@@ -225,7 +219,7 @@ EndFunc   ;==>_SettingsGui
 Func _Update()
 	TraySetToolTip($APP_NAME & " - updating...")
 	If Not $g_bDisc Then $g_bDisc = _Publish(_DiscoveryPackets())
-	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink)
+	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True)
 	$g_sLastRaw = $sRaw
 	Local $sStatus = _Field($sRaw, "Status")
 	Local $sPk, $sInfo
@@ -238,6 +232,16 @@ Func _Update()
 		Local $vSnrDown = _ToNum(_Field($sRaw, "SNR Downstream"), 1)
 		Local $vSnrUp = _ToNum(_Field($sRaw, "SNR Upstream"), 1)
 		Local $vUptime = _UptimeSec(_Field($sRaw, "Line Uptime"))
+		; 35b settings (read-only): enhance is 0/1, target is a raw number
+		Local $sEnhance = _Field($sRaw, "35b_enhance status")
+		If $sEnhance = "1" Then
+			$sEnhance = "enabled"
+		ElseIf $sEnhance = "0" Then
+			$sEnhance = "disabled"
+		Else
+			$sEnhance = "unknown"
+		EndIf
+		Local $vTarget = _ToNum(_Field($sRaw, "35b_target"), 1)
 		Local $sJson = '{"status":"' & _J($sStatus) & '"' & _
 				',"mode":"' & _J(_Field($sRaw, "Mode")) & '"' & _
 				',"profile":"' & _J(_Field($sRaw, "Profile")) & '"' & _
@@ -245,7 +249,19 @@ Func _Update()
 				',"dsl_version":"' & _J(_Field($sRaw, "DSL Version")) & '"' & _
 				',"down":' & _JNum($vDown) & ',"up":' & _JNum($vUp) & _
 				',"snr_down":' & _JNum($vSnrDown) & ',"snr_up":' & _JNum($vSnrUp) & _
-				',"uptime":' & _JNum($vUptime) & '}'
+				',"uptime":' & _JNum($vUptime) & _
+				',"enhance":"' & $sEnhance & '"' & _
+				',"target":' & _JNum($vTarget) & _
+				',"fw":"' & _J(_Field($sRaw, "Firmware Version")) & '"' & _
+				',"fw_model":"' & _J(_Field($sRaw, "Model Name")) & '"' & _
+				',"fw_device":"' & _J(_Field($sRaw, "Device Name")) & '"' & _
+				',"fw_build":"' & _J(_Field($sRaw, "Build Time")) & '"' & _
+				',"fw_branch":"' & _J(_Field($sRaw, "Branch")) & '"' & _
+				',"fw_release":"' & _J(_Field($sRaw, "Release Mode")) & '"' & _
+				',"fw_web":"' & _J(_Field($sRaw, "Web Version")) & '"' & _
+				',"fw_core":"' & _J(_Field($sRaw, "Core Version")) & '"' & _
+				',"fw_boot":"' & _J(_Field($sRaw, "Bootloader Version")) & '"' & _
+				',"fw_country":"' & _J(_Field($sRaw, "CountryCode")) & '"}'
 		$sPk = _Pkt($T_STATE, $sJson) & _Pkt($T_AVAIL, "online")
 		$sInfo = $sStatus & " | " & $vDown & "/" & $vUp & " Mbit/s | SNR " & $vSnrDown & "/" & $vSnrUp & " dB"
 	EndIf
@@ -254,7 +270,8 @@ Func _Update()
 	TraySetToolTip(StringLeft($APP_NAME & ": " & $sInfo, 120))
 EndFunc   ;==>_Update
 ; ---------- modem ----------
-Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink)
+; $bExtras = also run the read-only sysinfo / 35b commands (slower, used by the update cycle)
+Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False)
 	If Not FileExists($sPlink) Then Return "ERROR: plink.exe not found at " & $sPlink
 	Local $sCmd = '"' & $sPlink & '" -ssh -batch -l ' & $sUser & ' -pw "' & $sPass & '" ' & $sHost
 	Local $iPid = Run($sCmd, @ScriptDir, @SW_HIDE, BitOR($STDIN_CHILD, $STDOUT_CHILD, $STDERR_MERGED))
@@ -291,6 +308,14 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink)
 	EndIf
 	StdinWrite($iPid, "exec dslinfo" & @CR)
 	$sAll &= _ReadUntilQuiet($iPid, 1500, 10000, 4000)
+	If $bExtras Then
+		; read-only commands only - never send the setter variants (e.g. "exec dsl_35b_target 2048") from here
+		Local $aExtra[3] = ["exec sysinfo", "exec dsl_35b_enhance status", "exec dsl_35b_target show"]
+		For $c = 0 To UBound($aExtra) - 1
+			StdinWrite($iPid, $aExtra[$c] & @CR)
+			$sAll &= _ReadUntilQuiet($iPid, 700, 5000, 3000)
+		Next
+	EndIf
 	StdinWrite($iPid, "exit" & @CR)
 	Sleep(300)
 	ProcessClose($iPid)
@@ -349,29 +374,39 @@ EndFunc   ;==>_JNum
 ; ---------- home assistant discovery ----------
 Func _DiscoveryPackets()
 	Local $s = ""
-	$s &= _DiscPkt("status", "DSL Status", "status", "", "", "", "mdi:router-network", True)
-	$s &= _DiscPkt("downstream_rate", "DSL Downstream Rate", "down", "Mbit/s", "data_rate", "measurement", "", False)
-	$s &= _DiscPkt("upstream_rate", "DSL Upstream Rate", "up", "Mbit/s", "data_rate", "measurement", "", False)
-	$s &= _DiscPkt("snr_downstream", "DSL SNR Downstream", "snr_down", "dB", "", "measurement", "mdi:sine-wave", False)
-	$s &= _DiscPkt("snr_upstream", "DSL SNR Upstream", "snr_up", "dB", "", "measurement", "mdi:sine-wave", False)
-	$s &= _DiscPkt("uptime", "DSL Line Uptime", "uptime", "s", "duration", "measurement", "", False)
+	$s &= _DiscPkt("status", "DSL Status", "status", "", "", "", "mdi:router-network", _
+			"'mode':value_json.mode,'profile':value_json.profile,'annex':value_json.annex,'dsl_version':value_json.dsl_version")
+	$s &= _DiscPkt("downstream_rate", "DSL Downstream Rate", "down", "Mbit/s", "data_rate", "measurement", "")
+	$s &= _DiscPkt("upstream_rate", "DSL Upstream Rate", "up", "Mbit/s", "data_rate", "measurement", "")
+	$s &= _DiscPkt("snr_downstream", "DSL SNR Downstream", "snr_down", "dB", "", "measurement", "mdi:sine-wave")
+	$s &= _DiscPkt("snr_upstream", "DSL SNR Upstream", "snr_up", "dB", "", "measurement", "mdi:sine-wave")
+	$s &= _DiscPkt("uptime", "DSL Line Uptime", "uptime", "s", "duration", "measurement", "")
+	; diagnostic sensors (read-only)
+	$s &= _DiscPkt("35b_enhance", "DSL 35b Enhance", "enhance", "", "", "", "mdi:tune", "", True)
+	$s &= _DiscPkt("35b_target", "DSL 35b Target", "target", "", "", "", "mdi:target", "", True)
+	$s &= _DiscPkt("firmware", "DSL Modem Firmware", "fw", "", "", "", "mdi:chip", _
+			"'model':value_json.fw_model,'device_name':value_json.fw_device,'build_time':value_json.fw_build," & _
+			"'branch':value_json.fw_branch,'release_mode':value_json.fw_release,'web_version':value_json.fw_web," & _
+			"'core_version':value_json.fw_core,'bootloader_version':value_json.fw_boot,'country_code':value_json.fw_country", True)
 	Return $s
 EndFunc   ;==>_DiscoveryPackets
-Func _DiscPkt($sObj, $sName, $sField, $sUnit, $sDevClass, $sStateClass, $sIcon, $bAttrs)
+; $sAttrs = body of a Jinja dict for the entity attributes (optional), $bDiag = show under "Diagnostic"
+Func _DiscPkt($sObj, $sName, $sField, $sUnit, $sDevClass, $sStateClass, $sIcon, $sAttrs = "", $bDiag = False)
+	Local $iExpire = $g_iInterval * 3
+	If $iExpire < 180 Then $iExpire = 180
 	Local $s = '{"name":"' & $sName & '","unique_id":"vigor167_dsl_' & $sObj & '"' & _
 			',"state_topic":"' & $T_STATE & '"' & _
 			',"value_template":"{{ value_json.' & $sField & ' }}"' & _
 			',"availability_topic":"' & $T_AVAIL & '"' & _
-			',"expire_after":' & Max(180, $g_iInterval * 3)
+			',"expire_after":' & $iExpire
 	If $sUnit <> "" Then $s &= ',"unit_of_measurement":"' & $sUnit & '"'
 	If $sDevClass <> "" Then $s &= ',"device_class":"' & $sDevClass & '"'
 	If $sStateClass <> "" Then $s &= ',"state_class":"' & $sStateClass & '"'
 	If $sIcon <> "" Then $s &= ',"icon":"' & $sIcon & '"'
-	If $bAttrs Then
+	If $bDiag Then $s &= ',"entity_category":"diagnostic"'
+	If $sAttrs <> "" Then
 		$s &= ',"json_attributes_topic":"' & $T_STATE & '"' & _
-				',"json_attributes_template":"{{ {' & _
-				"'mode':value_json.mode,'profile':value_json.profile,'annex':value_json.annex,'dsl_version':value_json.dsl_version" & _
-				'} | tojson }}"'
+				',"json_attributes_template":"{{ {' & $sAttrs & '} | tojson }}"'
 	EndIf
 	$s &= ',"device":{"identifiers":["vigor167"],"name":"DrayTek Vigor167","manufacturer":"DrayTek","model":"Vigor167"}}'
 	Return _Pkt("homeassistant/sensor/vigor167_dsl/" & $sObj & "/config", $s)
@@ -469,7 +504,3 @@ Func _MqttSession($sPackets, $sHost, $iPort, $sUser, $sPass)
 	If Not $bOk Then $g_sMqttErr = "Sending PUBLISH failed"
 	Return $bOk
 EndFunc   ;==>_MqttSession
-Func Max($a, $b)
-	If $a > $b Then Return $a
-	Return $b
-EndFunc   ;==>Max
