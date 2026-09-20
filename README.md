@@ -6,3 +6,9 @@ known issues:
 laggy interface/traymenue
 
 tested: win11 only (should be run under Wine (Linux)
+
+Connection:
+INPUT: Modem (SSH)
+OUTPUT: MQTT*
+
+*Only use a private broker this is selfmade mqtt stuff!
