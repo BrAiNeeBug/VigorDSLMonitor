@@ -4,6 +4,7 @@
 #AutoIt3Wrapper_UseUpx=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
+#AutoIt3Wrapper_Add_Includes=n
 #AutoIt3Wrapper_AU3Check_Stop_OnWarning=y
 #AutoIt3Wrapper_AU3Check_Parameters=-d -w 1 -w 2 -w 3 -w 5 -w 6
 #AutoIt3Wrapper_Run_Stop_OnError=y
@@ -12,6 +13,7 @@
 #Tidy_Parameters=/rel
 #AutoIt3Wrapper_Run_Au3Stripper=y
 #Au3Stripper_Parameters=/so /rm
+#EndRegion ;**** Directives created by AutoIt3Wrapper_GUI ****
 #include-once
 #include <AutoItConstants.au3>
 #include <TrayConstants.au3>
@@ -21,6 +23,8 @@
 #include <StaticConstants.au3>
 #include <WindowsConstants.au3>
 #include <MsgBoxConstants.au3>
+#include <Misc.au3>
+If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Global Const $APP_NAME = "Vigor167 DSL Monitor"
 Global Const $INI_FILE = @ScriptDir & "\vigor167-dsl.ini"
@@ -103,15 +107,47 @@ EndFunc   ;==>_Exit
 Func _LoadSettings()
 	$g_sModemHost = IniRead($INI_FILE, "modem", "host", "192.168.167.1")
 	$g_sModemUser = IniRead($INI_FILE, "modem", "user", "admin")
-	$g_sModemPass = IniRead($INI_FILE, "modem", "pass", "")
+	$g_sModemPass = _Unprotect(IniRead($INI_FILE, "modem", "pass", ""))
 	$g_sPlink = IniRead($INI_FILE, "modem", "plink", @ScriptDir & "\plink.exe")
 	$g_sMqttHost = IniRead($INI_FILE, "mqtt", "host", "homeassistant.local")
 	$g_iMqttPort = Int(IniRead($INI_FILE, "mqtt", "port", "1883"))
 	$g_sMqttUser = IniRead($INI_FILE, "mqtt", "user", "")
-	$g_sMqttPass = IniRead($INI_FILE, "mqtt", "pass", "")
+	$g_sMqttPass = _Unprotect(IniRead($INI_FILE, "mqtt", "pass", ""))
 	$g_iInterval = Int(IniRead($INI_FILE, "general", "interval", "60"))
 	If $g_iInterval < 15 Then $g_iInterval = 15 ; do not hammer the modem
 EndFunc   ;==>_LoadSettings
+; ---------- password protection (Windows DPAPI, bound to current user) ----------
+Func _Protect($sPlain)
+	If $sPlain = "" Then Return ""
+	Local $bIn = StringToBinary($sPlain, 4)
+	Local $tData = DllStructCreate("byte[" & BinaryLen($bIn) & "]")
+	DllStructSetData($tData, 1, $bIn)
+	Local $tIn = DllStructCreate("dword cb; ptr pb")
+	$tIn.cb = BinaryLen($bIn)
+	$tIn.pb = DllStructGetPtr($tData)
+	Local $tOut = DllStructCreate("dword cb; ptr pb")
+	Local $aRet = DllCall("crypt32.dll", "bool", "CryptProtectData", "struct*", $tIn, "ptr", 0, "ptr", 0, "ptr", 0, "ptr", 0, "dword", 1, "struct*", $tOut)
+	If @error Or Not $aRet[0] Then Return SetError(1, 0, $sPlain)
+	Local $bOut = DllStructGetData(DllStructCreate("byte[" & $tOut.cb & "]", $tOut.pb), 1)
+	DllCall("kernel32.dll", "ptr", "LocalFree", "ptr", $tOut.pb)
+	Return "dpapi:" & Hex($bOut)
+EndFunc   ;==>_Protect
+Func _Unprotect($sStored)
+	; legacy plaintext values still work and get encrypted on the next Save
+	If StringLeft($sStored, 6) <> "dpapi:" Then Return $sStored
+	Local $bIn = Binary("0x" & StringTrimLeft($sStored, 6))
+	Local $tData = DllStructCreate("byte[" & BinaryLen($bIn) & "]")
+	DllStructSetData($tData, 1, $bIn)
+	Local $tIn = DllStructCreate("dword cb; ptr pb")
+	$tIn.cb = BinaryLen($bIn)
+	$tIn.pb = DllStructGetPtr($tData)
+	Local $tOut = DllStructCreate("dword cb; ptr pb")
+	Local $aRet = DllCall("crypt32.dll", "bool", "CryptUnprotectData", "struct*", $tIn, "ptr", 0, "ptr", 0, "ptr", 0, "ptr", 0, "dword", 1, "struct*", $tOut)
+	If @error Or Not $aRet[0] Then Return SetError(1, 0, "")
+	Local $bOut = DllStructGetData(DllStructCreate("byte[" & $tOut.cb & "]", $tOut.pb), 1)
+	DllCall("kernel32.dll", "ptr", "LocalFree", "ptr", $tOut.pb)
+	Return BinaryToString($bOut, 4)
+EndFunc   ;==>_Unprotect
 Func _AutostartGet()
 	Return RegRead($RUN_KEY, $RUN_NAME) <> ""
 EndFunc   ;==>_AutostartGet
@@ -199,12 +235,12 @@ Func _SettingsGui()
 				If $iInterval < 15 Then $iInterval = 15
 				IniWrite($INI_FILE, "modem", "host", StringStripWS(GUICtrlRead($iHost), 3))
 				IniWrite($INI_FILE, "modem", "user", GUICtrlRead($iUser))
-				IniWrite($INI_FILE, "modem", "pass", GUICtrlRead($iPass))
+				IniWrite($INI_FILE, "modem", "pass", _Protect(GUICtrlRead($iPass)))
 				IniWrite($INI_FILE, "modem", "plink", GUICtrlRead($iPlink))
 				IniWrite($INI_FILE, "mqtt", "host", StringStripWS(GUICtrlRead($iMHost), 3))
 				IniWrite($INI_FILE, "mqtt", "port", Int(GUICtrlRead($iMPort)))
 				IniWrite($INI_FILE, "mqtt", "user", GUICtrlRead($iMUser))
-				IniWrite($INI_FILE, "mqtt", "pass", GUICtrlRead($iMPass))
+				IniWrite($INI_FILE, "mqtt", "pass", _Protect(GUICtrlRead($iMPass)))
 				IniWrite($INI_FILE, "general", "interval", $iInterval)
 				_AutostartSet(BitAND(GUICtrlRead($iAuto), $GUI_CHECKED) = $GUI_CHECKED)
 				_LoadSettings()
