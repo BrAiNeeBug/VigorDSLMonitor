@@ -42,6 +42,8 @@ Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
 Global $g_sLastRaw = "", $g_sMqttErr = ""
 Global $g_idStatus, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
 Global $g_hPoll
+; persistent SSH session to the modem (PID of plink, 0 = no session)
+Global $g_iSsh = 0, $g_sSshErr = ""
 _LoadSettings()
 TCPStartup()
 OnAutoItExitRegister("_Exit")
@@ -73,6 +75,7 @@ While True
 			If $g_bPaused Then
 				TrayItemSetText($g_idPause, "Resume polling")
 				TrayItemSetText($g_idStatus, "Paused")
+				_SshDrop() ; free the modem's SSH slot while paused
 			Else
 				TrayItemSetText($g_idPause, "Pause polling")
 				_Update()
@@ -85,6 +88,7 @@ While True
 		Case $g_idSettings
 			If _SettingsGui() Then
 				$g_bDisc = False ; re-send discovery with the new settings
+				_SshDrop() ; reconnect with the new settings
 				_Update()
 				$g_hPoll = TimerInit()
 			EndIf
@@ -101,6 +105,7 @@ Exit
 Func _Exit()
 	; mark sensors unavailable on a clean exit (retained availability topic)
 	If $g_bRunning Then _Publish(_Pkt($T_AVAIL, "offline"))
+	_SshDrop()
 	TCPShutdown()
 EndFunc   ;==>_Exit
 ; ---------- settings ----------
@@ -255,7 +260,7 @@ EndFunc   ;==>_SettingsGui
 Func _Update()
 	TraySetToolTip($APP_NAME & " - updating...")
 	If Not $g_bDisc Then $g_bDisc = _Publish(_DiscoveryPackets())
-	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True)
+	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True, True)
 	$g_sLastRaw = $sRaw
 	Local $sStatus = _Field($sRaw, "Status")
 	Local $sPk, $sInfo
@@ -306,42 +311,82 @@ Func _Update()
 	TraySetToolTip(StringLeft($APP_NAME & ": " & $sInfo, 120))
 EndFunc   ;==>_Update
 ; ---------- modem ----------
-; $bExtras = also run the read-only sysinfo / 35b commands (slower, used by the update cycle)
-Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False)
-	If Not FileExists($sPlink) Then Return "ERROR: plink.exe not found at " & $sPlink
+; Keeps ONE plink/SSH session open between polls (the modem only has a handful of PTYs,
+; opening + killing a session every poll leaked them until the modem ran out).
+; $bExtras  = also run the read-only sysinfo / 35b commands (slower, used by the update cycle)
+; $bPersist = reuse/keep the global session (update cycle). False = one-shot session that is
+;             closed cleanly afterwards (used by the "Test modem" button).
+Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist = False)
+	Local $iPid, $sRaw = "", $bReused
+	For $iTry = 1 To 2
+		$bReused = False
+		If $bPersist And $g_iSsh <> 0 And Not ProcessExists($g_iSsh) Then $g_iSsh = 0 ; session died on its own
+		If $bPersist And $g_iSsh <> 0 Then
+			$iPid = $g_iSsh
+			$bReused = True
+		Else
+			$iPid = _SshOpen($sHost, $sUser, $sPass, $sPlink)
+			If $iPid = 0 Then Return $g_sSshErr
+			If $bPersist Then $g_iSsh = $iPid
+		EndIf
+		$sRaw = _SshQuery($iPid, $bExtras)
+		If Not $bPersist Then
+			_SshClose($iPid)
+			Return $sRaw
+		EndIf
+		If _Field($sRaw, "Status") <> "" Then Return $sRaw
+		; no usable answer -> drop the session; retry once with a fresh one if the old one was reused
+		_SshDrop()
+		If Not $bReused Then ExitLoop ; a fresh session failed as well -> wait for the next poll
+	Next
+	Return $sRaw
+EndFunc   ;==>_FetchDslInfo
+; opens plink, does the SSH + CLI login, returns the PID (0 on failure, reason in $g_sSshErr)
+Func _SshOpen($sHost, $sUser, $sPass, $sPlink)
+	$g_sSshErr = ""
+	If Not FileExists($sPlink) Then
+		$g_sSshErr = "ERROR: plink.exe not found at " & $sPlink
+		Return 0
+	EndIf
 	Local $sCmd = '"' & $sPlink & '" -ssh -batch -l ' & $sUser & ' -pw "' & $sPass & '" ' & $sHost
 	Local $iPid = Run($sCmd, @ScriptDir, @SW_HIDE, BitOR($STDIN_CHILD, $STDOUT_CHILD, $STDERR_MERGED))
-	If @error Then Return "ERROR: could not start plink"
-	Local $sAll = "", $sNew, $aPrompt, $bLoggedIn = False, $iWait
+	If @error Then
+		$g_sSshErr = "ERROR: could not start plink"
+		Return 0
+	EndIf
+	Local $sAll = "", $sNew, $aPrompt, $iWait
 	For $i = 1 To 6
 		$iWait = 4000
 		If $i = 1 Then $iWait = 15000
 		$sNew = _ReadUntilQuiet($iPid, 800, 15000, $iWait)
 		$sAll &= $sNew
 		If $sNew = "" Then
-			ProcessClose($iPid)
-			Return "ERROR: no data from plink (round " & $i & ")" & @CRLF & "---" & @CRLF & $sAll
+			_SshClose($iPid)
+			$g_sSshErr = "ERROR: no data from plink (round " & $i & ")" & @CRLF & "---" & @CRLF & $sAll
+			Return 0
 		EndIf
 		If StringInStr($sNew, "Access denied") Then
-			ProcessClose($iPid)
-			Return "ERROR: access denied" & @CRLF & "---" & @CRLF & $sAll
+			_SshClose($iPid)
+			$g_sSshErr = "ERROR: access denied" & @CRLF & "---" & @CRLF & $sAll
+			Return 0
 		EndIf
 		; modem CLI has its own Username:/Password: prompts after the SSH login
 		$aPrompt = StringRegExp(StringLower(StringStripWS($sNew, 2)), "(username|password):$", 1)
-		If @error Then
-			$bLoggedIn = True
-			ExitLoop
-		EndIf
+		If @error Then Return $iPid ; no more prompts -> logged in at the CLI
 		If $aPrompt[0] = "username" Then
 			StdinWrite($iPid, $sUser & @CR)
 		Else
 			StdinWrite($iPid, $sPass & @CR)
 		EndIf
 	Next
-	If Not $bLoggedIn Then
-		ProcessClose($iPid)
-		Return "ERROR: login loop did not finish" & @CRLF & "---" & @CRLF & $sAll
-	EndIf
+	_SshClose($iPid)
+	$g_sSshErr = "ERROR: login loop did not finish" & @CRLF & "---" & @CRLF & $sAll
+	Return 0
+EndFunc   ;==>_SshOpen
+; runs the read-only commands on an open session and returns the raw output
+Func _SshQuery($iPid, $bExtras)
+	Local $sAll = ""
+	_ReadUntilQuiet($iPid, 100, 500, 100) ; throw away leftovers (prompt etc.) from the previous round
 	StdinWrite($iPid, "exec dslinfo" & @CR)
 	$sAll &= _ReadUntilQuiet($iPid, 1500, 10000, 4000)
 	If $bExtras Then
@@ -352,11 +397,27 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False)
 			$sAll &= _ReadUntilQuiet($iPid, 700, 5000, 3000)
 		Next
 	EndIf
-	StdinWrite($iPid, "exit" & @CR)
-	Sleep(300)
-	ProcessClose($iPid)
 	Return $sAll
-EndFunc   ;==>_FetchDslInfo
+EndFunc   ;==>_SshQuery
+; clean shutdown: CLI "exit" and wait for plink to quit by itself. If it doesn't, StdioClose()
+; closes the pipes (plink sees EOF and disconnects properly). Kill is the last resort.
+Func _SshClose($iPid)
+	If $iPid = 0 Then Return
+	If ProcessExists($iPid) Then
+		StdinWrite($iPid, "exit" & @CR)
+		ProcessWaitClose($iPid, 3)
+	EndIf
+	StdioClose($iPid)
+	If ProcessExists($iPid) Then
+		ProcessWaitClose($iPid, 2)
+		If ProcessExists($iPid) Then ProcessClose($iPid)
+	EndIf
+EndFunc   ;==>_SshClose
+; closes the persistent session (if any)
+Func _SshDrop()
+	_SshClose($g_iSsh)
+	$g_iSsh = 0
+EndFunc   ;==>_SshDrop
 ; $iFirstMs = max wait for the first byte, afterwards $iQuietMs of silence ends the read
 Func _ReadUntilQuiet($iPid, $iQuietMs, $iMaxMs, $iFirstMs)
 	Local $sBuf = "", $sChunk
