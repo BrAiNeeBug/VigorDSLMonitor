@@ -4,6 +4,7 @@ thats all then you can start the monitor setup creds and go...
 
 known issues:
 laggy interface/traymenue
+sshserver crash on modemside...
 
 tested: win11 only (should be run under Wine (Linux)
 
