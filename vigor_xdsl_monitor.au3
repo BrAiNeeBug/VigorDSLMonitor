@@ -24,6 +24,7 @@
 #include <WindowsConstants.au3>
 #include <MsgBoxConstants.au3>
 #include <Misc.au3>
+#include <InetConstants.au3>
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Global Const $APP_NAME = "Vigor167 DSL Monitor"
@@ -44,6 +45,15 @@ Global $g_idStatus, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
 Global $g_hPoll
 ; persistent SSH session to the modem (PID of plink, 0 = no session)
 Global $g_iSsh = 0, $g_sSshErr = ""
+; age of the current persistent session; recycled with a clean logout before it
+; wedges, so the modem never runs out of SSH/PTY slots over days of uptime
+Global $g_hSshAge = 0
+Global Const $SSH_MAX_AGE = 6 * 60 * 60 * 1000 ; 6 h in ms
+; where to auto-download plink.exe from if it can't be found anywhere else
+; (official PuTTY site first, official chiark mirror as fallback)
+Global Const $PLINK_URLS[2] = [ _
+		"https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe", _
+		"https://www.chiark.greenend.org.uk/~sgtatham/putty/latest/w64/plink.exe"]
 _LoadSettings()
 TCPStartup()
 OnAutoItExitRegister("_Exit")
@@ -320,6 +330,9 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist 
 	Local $iPid, $sRaw = "", $bReused
 	For $iTry = 1 To 2
 		$bReused = False
+		; proactively recycle a long-lived session with a clean logout before it
+		; wedges - a stuck-then-hard-killed session is what leaks the modem's slots
+		If $bPersist And $g_iSsh <> 0 And $g_hSshAge <> 0 And TimerDiff($g_hSshAge) > $SSH_MAX_AGE Then _SshDrop()
 		If $bPersist And $g_iSsh <> 0 And Not ProcessExists($g_iSsh) Then $g_iSsh = 0 ; session died on its own
 		If $bPersist And $g_iSsh <> 0 Then
 			$iPid = $g_iSsh
@@ -327,7 +340,10 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist 
 		Else
 			$iPid = _SshOpen($sHost, $sUser, $sPass, $sPlink)
 			If $iPid = 0 Then Return $g_sSshErr
-			If $bPersist Then $g_iSsh = $iPid
+			If $bPersist Then
+				$g_iSsh = $iPid
+				$g_hSshAge = TimerInit()
+			EndIf
 		EndIf
 		$sRaw = _SshQuery($iPid, $bExtras)
 		If Not $bPersist Then
@@ -341,11 +357,46 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist 
 	Next
 	Return $sRaw
 EndFunc   ;==>_FetchDslInfo
+; resolves a working plink.exe: configured path -> script folder -> system PATH ->
+; last resort: auto-download the official binary into the script folder.
+; Returns "" if nothing works.
+Func _ResolvePlink($sConfigured)
+	If $sConfigured <> "" And FileExists($sConfigured) Then Return $sConfigured
+	Local $sLocal = @ScriptDir & "\plink.exe"
+	If FileExists($sLocal) Then Return $sLocal
+	Local $sInPath = _WhichExe("plink.exe")
+	If $sInPath <> "" Then Return $sInPath
+	If _DownloadPlink($sLocal) Then Return $sLocal
+	Return ""
+EndFunc   ;==>_ResolvePlink
+; looks up an .exe name via the Windows system PATH ("where"); "" if not found
+Func _WhichExe($sExeName)
+	Local $iPid = Run(@ComSpec & " /c where " & $sExeName, "", @SW_HIDE, $STDOUT_CHILD)
+	ProcessWaitClose($iPid, 3)
+	Local $sOut = StringStripCR(StdoutRead($iPid))
+	If @error Then Return ""
+	Local $aLines = StringSplit($sOut, @LF, 1)
+	For $i = 1 To $aLines[0]
+		If FileExists($aLines[$i]) Then Return $aLines[$i]
+	Next
+	Return ""
+EndFunc   ;==>_WhichExe
+; downloads plink.exe from the official PuTTY site (with a mirror fallback) to $sDest
+Func _DownloadPlink($sDest)
+	TrayTip($APP_NAME, "plink.exe not found - downloading it from the official PuTTY site...", 5)
+	For $i = 0 To UBound($PLINK_URLS) - 1
+		Local $iBytes = InetGet($PLINK_URLS[$i], $sDest, $INET_FORCERELOAD)
+		If Not @error And $iBytes > 100000 And FileExists($sDest) Then Return True
+		If FileExists($sDest) Then FileDelete($sDest) ; partial/broken download
+	Next
+	Return False
+EndFunc   ;==>_DownloadPlink
 ; opens plink, does the SSH + CLI login, returns the PID (0 on failure, reason in $g_sSshErr)
 Func _SshOpen($sHost, $sUser, $sPass, $sPlink)
 	$g_sSshErr = ""
-	If Not FileExists($sPlink) Then
-		$g_sSshErr = "ERROR: plink.exe not found at " & $sPlink
+	$sPlink = _ResolvePlink($sPlink)
+	If $sPlink = "" Then
+		$g_sSshErr = "ERROR: plink.exe not found (checked the configured path, PATH and the script folder) and the automatic download failed - check your internet connection or place plink.exe manually"
 		Return 0
 	EndIf
 	Local $sCmd = '"' & $sPlink & '" -ssh -batch -l ' & $sUser & ' -pw "' & $sPass & '" ' & $sHost
@@ -404,19 +455,25 @@ EndFunc   ;==>_SshQuery
 Func _SshClose($iPid)
 	If $iPid = 0 Then Return
 	If ProcessExists($iPid) Then
+		; 1) ask the modem CLI to log out
 		StdinWrite($iPid, "exit" & @CR)
-		ProcessWaitClose($iPid, 3)
+		Sleep(300)
+		; 2) close our stdin -> plink sees EOF and sends a proper SSH disconnect.
+		;    This is what actually frees the modem's PTY/SSH slot; a hard kill
+		;    leaves the slot occupied until the modem's own TCP timeout, and over
+		;    days of polling that exhausts the daemon (SSH "dies" after 2-3 days).
+		StdioClose($iPid)
+		ProcessWaitClose($iPid, 8) ; give the clean disconnect time to complete
+	Else
+		StdioClose($iPid)
 	EndIf
-	StdioClose($iPid)
-	If ProcessExists($iPid) Then
-		ProcessWaitClose($iPid, 2)
-		If ProcessExists($iPid) Then ProcessClose($iPid)
-	EndIf
+	If ProcessExists($iPid) Then ProcessClose($iPid) ; last resort only
 EndFunc   ;==>_SshClose
 ; closes the persistent session (if any)
 Func _SshDrop()
 	_SshClose($g_iSsh)
 	$g_iSsh = 0
+	$g_hSshAge = 0
 EndFunc   ;==>_SshDrop
 ; $iFirstMs = max wait for the first byte, afterwards $iQuietMs of silence ends the read
 Func _ReadUntilQuiet($iPid, $iQuietMs, $iMaxMs, $iFirstMs)
