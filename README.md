@@ -1,5 +1,6 @@
 (not-stable! this app is still in test dont use in production!!!!)
-if you update from x to 0.1, remove the autostart option first and activate if after update, otherwise you leave an ghostentry in your system wich needs regedit handling ;)
+if you update from x to 0.1, remove the start-with-windows option first and activate if after...
+otherwise you leave an autoostart-ghostentry in your system wich needs regedit handling ;)
 
 My quick solution integrate the DSL/VDSL Status of a Vigor Modem into HA...
 
