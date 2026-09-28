@@ -2,9 +2,10 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
+#AutoIt3Wrapper_Res_Fileversion=0.1.0.1
+#AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
-#AutoIt3Wrapper_Add_Includes=n
 #AutoIt3Wrapper_AU3Check_Stop_OnWarning=y
 #AutoIt3Wrapper_AU3Check_Parameters=-d -w 1 -w 2 -w 3 -w 5 -w 6
 #AutoIt3Wrapper_Run_Stop_OnError=y
@@ -27,21 +28,23 @@
 #include <InetConstants.au3>
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
-Global Const $APP_NAME = "Vigor167 DSL Monitor"
-Global Const $INI_FILE = @ScriptDir & "\vigor167-dsl.ini"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.1)"
+Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
+Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
-Global Const $RUN_NAME = "Vigor167DslMonitor"
-Global Const $MQTT_CLIENT_ID = "vigor167-autoit"
-Global Const $T_STATE = "vigor167/dsl/state"
-Global Const $T_AVAIL = "vigor167/dsl/availability"
+Global Const $RUN_NAME = "VigorXdslMonitor"
+Global Const $MQTT_CLIENT_ID = "vigor-xdsl-autoit"
+Global Const $T_STATE = "vigor/xdsl/state"
+Global Const $T_AVAIL = "vigor/xdsl/availability"
 ; settings (loaded from INI)
 Global $g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink
 Global $g_sMqttHost, $g_iMqttPort, $g_sMqttUser, $g_sMqttPass
+Global $g_bPassErr = False ; True if a stored password could not be decrypted (e.g. INI copied from another PC/user)
 Global $g_iInterval
 ; runtime state
 Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
-Global $g_sLastRaw = "", $g_sMqttErr = ""
-Global $g_idStatus, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
+Global $g_sLastRaw = "", $g_sMqttErr = "", $g_sModel = "" ; $g_sModel = model name read from the modem (for the HA device)
+Global $g_idApp, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
 Global $g_hPoll
 ; persistent SSH session to the modem (PID of plink, 0 = no session)
 Global $g_iSsh = 0, $g_sSshErr = ""
@@ -54,6 +57,14 @@ Global Const $SSH_MAX_AGE = 6 * 60 * 60 * 1000 ; 6 h in ms
 Global Const $PLINK_URLS[2] = [ _
 		"https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe", _
 		"https://www.chiark.greenend.org.uk/~sgtatham/putty/latest/w64/plink.exe"]
+; take over an INI from an older version once, this could be removed after some udpates!!!
+If Not FileExists($INI_FILE) Then
+	If FileExists(@ScriptDir & "\vigor_xdsl.ini") Then
+		FileCopy(@ScriptDir & "\vigor_xdsl.ini", $INI_FILE)
+	ElseIf FileExists(@ScriptDir & "\vigor167-dsl.ini") Then
+		FileCopy(@ScriptDir & "\vigor167-dsl.ini", $INI_FILE)
+	EndIf
+EndIf
 _LoadSettings()
 TCPStartup()
 OnAutoItExitRegister("_Exit")
@@ -61,9 +72,15 @@ OnAutoItExitRegister("_Exit")
 If Not FileExists($INI_FILE) Then
 	If Not _SettingsGui() Then Exit
 EndIf
+; INI copied from another PC/user/Wine prefix -> DPAPI can't decrypt, so don't even try to connect
+If $g_bPassErr Then
+	MsgBox($MB_ICONERROR, $APP_NAME, "The stored password(s) could not be decrypted." & @CRLF & _
+			"They are bound to the Windows user/machine that saved them (DPAPI)." & @CRLF & @CRLF & _
+			"Please re-enter the passwords in the settings.")
+	If Not _SettingsGui() Then Exit
+EndIf
 ; tray menu
-$g_idStatus = TrayCreateItem("Starting...")
-TrayItemSetState($g_idStatus, $TRAY_DISABLE)
+$g_idApp = TrayCreateItem($APP_NAME)
 TrayCreateItem("")
 $g_idNow = TrayCreateItem("Update now")
 $g_idPause = TrayCreateItem("Pause polling")
@@ -77,6 +94,8 @@ _Update()
 $g_hPoll = TimerInit()
 While True
 	Switch TrayGetMsg()
+		Case $g_idApp
+			ShellExecute($APP_URL)
 		Case $g_idNow
 			_Update()
 			$g_hPoll = TimerInit()
@@ -84,7 +103,7 @@ While True
 			$g_bPaused = Not $g_bPaused
 			If $g_bPaused Then
 				TrayItemSetText($g_idPause, "Resume polling")
-				TrayItemSetText($g_idStatus, "Paused")
+				TraySetToolTip($APP_NAME & " - paused")
 				_SshDrop() ; free the modem's SSH slot while paused
 			Else
 				TrayItemSetText($g_idPause, "Pause polling")
@@ -120,14 +139,17 @@ Func _Exit()
 EndFunc   ;==>_Exit
 ; ---------- settings ----------
 Func _LoadSettings()
-	$g_sModemHost = IniRead($INI_FILE, "modem", "host", "192.168.167.1")
+	$g_bPassErr = False
+	$g_sModemHost = IniRead($INI_FILE, "modem", "host", "192.168.1.1")
 	$g_sModemUser = IniRead($INI_FILE, "modem", "user", "admin")
 	$g_sModemPass = _Unprotect(IniRead($INI_FILE, "modem", "pass", ""))
+	If @error Then $g_bPassErr = True
 	$g_sPlink = IniRead($INI_FILE, "modem", "plink", @ScriptDir & "\plink.exe")
 	$g_sMqttHost = IniRead($INI_FILE, "mqtt", "host", "homeassistant.local")
 	$g_iMqttPort = Int(IniRead($INI_FILE, "mqtt", "port", "1883"))
 	$g_sMqttUser = IniRead($INI_FILE, "mqtt", "user", "")
 	$g_sMqttPass = _Unprotect(IniRead($INI_FILE, "mqtt", "pass", ""))
+	If @error Then $g_bPassErr = True
 	$g_iInterval = Int(IniRead($INI_FILE, "general", "interval", "60"))
 	If $g_iInterval < 15 Then $g_iInterval = 15 ; do not hammer the modem
 EndFunc   ;==>_LoadSettings
@@ -269,14 +291,13 @@ EndFunc   ;==>_SettingsGui
 ; ---------- update cycle ----------
 Func _Update()
 	TraySetToolTip($APP_NAME & " - updating...")
-	If Not $g_bDisc Then $g_bDisc = _Publish(_DiscoveryPackets())
 	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True, True)
 	$g_sLastRaw = $sRaw
 	Local $sStatus = _Field($sRaw, "Status")
-	Local $sPk, $sInfo
+	Local $sPk, $sTip
 	If $sStatus = "" Then
 		$sPk = _Pkt($T_AVAIL, "offline")
-		$sInfo = "Modem unreachable"
+		$sTip = _TipHead() & @CRLF & "Modem unreachable"
 	Else
 		Local $vDown = _ToNum(_Field($sRaw, "Downstream Line Rate"), 1000)
 		Local $vUp = _ToNum(_Field($sRaw, "Upstream Line Rate"), 1000)
@@ -313,13 +334,26 @@ Func _Update()
 				',"fw_core":"' & _J(_Field($sRaw, "Core Version")) & '"' & _
 				',"fw_boot":"' & _J(_Field($sRaw, "Bootloader Version")) & '"' & _
 				',"fw_country":"' & _J(_Field($sRaw, "CountryCode")) & '"}'
+		; model name comes from the modem itself; (re)send discovery on first success or when it changes
+		Local $sModel = _Field($sRaw, "Model Name")
+		If $sModel <> "" And $sModel <> $g_sModel Then
+			$g_sModel = $sModel
+			$g_bDisc = False
+		EndIf
+		If Not $g_bDisc Then $g_bDisc = _Publish(_DiscoveryPackets())
 		$sPk = _Pkt($T_STATE, $sJson) & _Pkt($T_AVAIL, "online")
-		$sInfo = $sStatus & " | " & $vDown & "/" & $vUp & " Mbit/s | SNR " & $vSnrDown & "/" & $vSnrUp & " dB"
+		$sTip = _TipHead() & " / " & $sStatus & @CRLF & "Down " & $vDown & " / Up " & $vUp & " Mbit/s" & @CRLF & "SNR Down " & $vSnrDown & " / Up " & $vSnrUp & " dB"
 	EndIf
-	If Not _Publish($sPk) Then $sInfo &= " (MQTT error)"
-	TrayItemSetText($g_idStatus, $sInfo)
-	TraySetToolTip(StringLeft($APP_NAME & ": " & $sInfo, 120))
+	If Not _Publish($sPk) Then
+		$sTip &= @CRLF & "(MQTT error)"
+	EndIf
+	TraySetToolTip(StringLeft($sTip, 127)) ; tray tooltips are limited to 127 chars
 EndFunc   ;==>_Update
+; first tooltip line: modem model (from sysinfo) or the app name until it is known
+Func _TipHead()
+	If $g_sModel <> "" Then Return $g_sModel
+	Return $APP_NAME
+EndFunc   ;==>_TipHead
 ; ---------- modem ----------
 ; Keeps ONE plink/SSH session open between polls (the modem only has a handful of PTYs,
 ; opening + killing a session every poll leaked them until the modem ran out).
@@ -548,7 +582,7 @@ EndFunc   ;==>_DiscoveryPackets
 Func _DiscPkt($sObj, $sName, $sField, $sUnit, $sDevClass, $sStateClass, $sIcon, $sAttrs = "", $bDiag = False)
 	Local $iExpire = $g_iInterval * 3
 	If $iExpire < 180 Then $iExpire = 180
-	Local $s = '{"name":"' & $sName & '","unique_id":"vigor167_dsl_' & $sObj & '"' & _
+	Local $s = '{"name":"' & $sName & '","unique_id":"vigor_xdsl_' & $sObj & '"' & _
 			',"state_topic":"' & $T_STATE & '"' & _
 			',"value_template":"{{ value_json.' & $sField & ' }}"' & _
 			',"availability_topic":"' & $T_AVAIL & '"' & _
@@ -562,8 +596,12 @@ Func _DiscPkt($sObj, $sName, $sField, $sUnit, $sDevClass, $sStateClass, $sIcon, 
 		$s &= ',"json_attributes_topic":"' & $T_STATE & '"' & _
 				',"json_attributes_template":"{{ {' & $sAttrs & '} | tojson }}"'
 	EndIf
-	$s &= ',"device":{"identifiers":["vigor167"],"name":"DrayTek Vigor167","manufacturer":"DrayTek","model":"Vigor167"}}'
-	Return _Pkt("homeassistant/sensor/vigor167_dsl/" & $sObj & "/config", $s)
+	Local $sModel = $g_sModel
+	If $sModel = "" Then $sModel = "Vigor"
+	Local $sDevName = $sModel
+	If Not StringInStr($sDevName, "DrayTek") Then $sDevName = "DrayTek " & $sDevName
+	$s &= ',"device":{"identifiers":["vigor_xdsl"],"name":"' & _J($sDevName) & '","manufacturer":"DrayTek","model":"' & _J($sModel) & '"}}'
+	Return _Pkt("homeassistant/sensor/vigor_xdsl/" & $sObj & "/config", $s)
 EndFunc   ;==>_DiscPkt
 ; ---------- minimal MQTT 3.1.1 client (QoS 0, retained publish) ----------
 ; builds one retained PUBLISH packet as hex string
