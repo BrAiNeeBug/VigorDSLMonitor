@@ -1,6 +1,6 @@
 #Region ;**** Directives created by AutoIt3Wrapper_GUI ****
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
-#AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
+#AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor2.exe
 #AutoIt3Wrapper_UseUpx=y
 #AutoIt3Wrapper_Res_Fileversion=0.3.0.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
@@ -53,7 +53,7 @@ Global $g_fSnrAlert ; 0 = off
 ; runtime state
 Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
 Global $g_sLastRaw = "", $g_sMqttErr = "", $g_sModel = "" ; $g_sModel = model name read from the modem (for the HA device)
-Global $g_idApp, $g_idShow, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
+Global $g_idApp, $g_idShow, $g_idExit
 Global $g_hPoll, $g_hTick
 ; persistent SSH session to the modem (PID of plink, 0 = no session)
 Global $g_iSsh = 0, $g_sSshErr = ""
@@ -127,11 +127,7 @@ $g_idApp = TrayCreateItem($APP_NAME)
 TrayCreateItem("")
 $g_idShow = TrayCreateItem("Show window")
 TrayItemSetState($g_idShow, $TRAY_DEFAULT)
-$g_idNow = TrayCreateItem("Update now")
-$g_idPause = TrayCreateItem("Pause polling")
-$g_idRaw = TrayCreateItem("Show last raw output")
 TrayCreateItem("")
-$g_idSettings = TrayCreateItem("Settings...")
 $g_idExit = TrayCreateItem("Exit")
 TraySetToolTip($APP_NAME)
 $g_bRunning = True
@@ -147,15 +143,6 @@ While True
 			ShellExecute($APP_URL)
 		Case $g_idShow, $TRAY_EVENT_PRIMARYDOUBLE
 			_WinShow()
-		Case $g_idNow
-			_PollNow()
-		Case $g_idPause
-			_TogglePause()
-		Case $g_idRaw
-			_WinShow()
-			GUICtrlSetState($g_idTiRaw, $GUI_SHOW)
-		Case $g_idSettings
-			_DoSettings()
 		Case $g_idExit
 			ExitLoop
 	EndSwitch
@@ -532,14 +519,12 @@ EndFunc   ;==>_PollNow
 Func _TogglePause()
 	$g_bPaused = Not $g_bPaused
 	If $g_bPaused Then
-		TrayItemSetText($g_idPause, "Resume polling")
 		GUICtrlSetData($g_idBtnPause, "Resume")
 		TraySetToolTip($APP_NAME & " - paused")
 		_SshDrop() ; free the modem's SSH slot while paused
 		_Log("Polling paused")
 		_UiRefresh()
 	Else
-		TrayItemSetText($g_idPause, "Pause polling")
 		GUICtrlSetData($g_idBtnPause, "Pause")
 		_Log("Polling resumed")
 		_Update()
