@@ -69,7 +69,7 @@ Developed and tested on a **Vigor167** (firmware 5.2.9). Other Vigor xDSL modems
 - To run from source: [AutoIt3](https://www.autoitscript.com/)
 
 ## Installation
-1. Download the exe from the releases page, or compile `vigor_xdsl_monitor2.au3` with AutoIt3Wrapper (the compile directives are in the script header).
+1. Download the exe from the releases page, or compile `vigor_xdsl_monitor.au3` with AutoIt3Wrapper (the compile directives are in the script header).
 2. Start it. On first run the Settings dialog opens: enter the modem host, user and password and the MQTT broker.
 3. Press **Test modem** and **Test MQTT**, then **Save**.
 4. The sensors appear in Home Assistant under the device named after your modem.
