@@ -2,7 +2,7 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.3.1.0
+#AutoIt3Wrapper_Res_Fileversion=0.4.0.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -31,9 +31,9 @@
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
-Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.3)"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.4)"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
-Global Const $APP_VER = "0.3.1"
+Global Const $APP_VER = "0.4.0"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -50,6 +50,7 @@ Global $g_bMqttOn, $g_sClientId, $g_sTopicBase, $g_sDiscPrefix
 Global $g_bPassErr = False ; True if a stored password could not be decrypted (e.g. INI copied from another PC/user)
 Global $g_iInterval, $g_iSshMaxAge, $g_iHistLen
 Global $g_bStartHidden, $g_bHideOnClose, $g_bNotify, $g_bCsv
+Global $g_bMqttDiag = True ; publish the diagnostic sensors (error counters, trellis, ...) to MQTT / HA
 Global $g_fSnrAlert ; 0 = off
 ; runtime state
 Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
@@ -72,8 +73,21 @@ Global $g_sStatus = "", $g_sMode = "", $g_sProfile = "", $g_sAnnex = "", $g_sDsl
 Global $g_vDown = "", $g_vUp = "", $g_vSnrD = "", $g_vSnrU = "", $g_vTarget = ""
 Global $g_vAttD = "", $g_vAttU = "" ; attainable (max) line rate
 Global $g_bAttWarned = False
-; the attainable rates take 10+ s to read ("show all"), so they are only queried every $g_iAttInterval seconds
-Global $g_iAttInterval = 300, $g_hAtt = 0, $g_bAttRan = False
+; Extended line data (attainable rates, trellis, bitswap, error counters, ...) only exists in the slow config-submenu
+; "show all" (10+ s). It is read at program start, after every (re)connect / resync / line-up and otherwise only every
+; $g_iExtInterval seconds (never less than $EXT_MIN_FACTOR x the normal poll interval).
+Global Const $EXT_MIN_FACTOR = 5
+Global $g_iExtInterval = 900, $g_hExt = 0, $g_bExtRan = False, $g_bExtHave = False, $g_hExtOk = 0, $g_iExtFail = 0
+; rows of the End_Table in the "show all" JSON. Kind of each row:
+; T = feature (text "near / far"), A = attenuation (dB), E = error counter (HA sensor, red in the GUI when > 0),
+; N = normal counter (HA sensor), H = like E but no HA sensor, O = only GUI + MQTT state JSON
+Global Const $EXT_NAMES[20] = ["Trellis", "Bitswap", "ReTx", "Attenuation", "CRC", "FECS", "ES", "SES", "LOSS", "UAS", _
+		"HEC Errors", "RS Corrections", "LOS Failure", "LOF Failure", "LPR Failure", "NCD Failure", "LCD Failure", "NFEC", "RFEC", "LYSMB"]
+Global Const $EXT_KIND = "TTTAEOEEHNEOEEEHEONO"
+Global Const $STR_NAMES[3] = ["Path Mode", "Interleave Depth", "Actual PSD"] ; rows of the Stream_Table (down / up)
+Global $g_aEnd[20][2], $g_aStr[3][2] ; [row][0] = near end / downstream, [row][1] = far end / upstream
+Global $g_sPwrMode = "", $g_sVidR = "", $g_sVidC = "" ; power management mode, modem (ATU-R) and DSLAM (ATU-C) vendor ID
+Global $g_sExtRaw = "", $g_sExtRawTime = "" ; last extended output, kept for the Raw tab
 Global $g_iUptime = "", $g_hUptime = 0
 Global $g_hStart = TimerInit() ; start of this program = monitor uptime
 Global $g_sLastTime = "-", $g_sMqttState = "-", $g_sMqttPrevErr = ""
@@ -102,6 +116,7 @@ Global $g_idDown, $g_idUp, $g_idSnrD, $g_idSnrU
 Global $g_idAttD, $g_idAttU, $g_idMonUpt, $g_idUpt, $g_idMode, $g_idProf, $g_idAnnex, $g_idDslV, $g_idEnh, $g_idTgt
 Global $g_idLast, $g_idNext, $g_idSsh, $g_idMqttS, $g_idPolls, $g_idResync
 Global $g_aFwId[10]
+Global $g_aFeatId[4], $g_aExtId[20][2], $g_aStrId[3], $g_idPwr, $g_idVidR, $g_idVidC, $g_idExtLast, $g_idExtNext
 Global $g_idGrRate, $g_idGrSnr
 Global $g_idLog = 0, $g_idRawEdit, $g_sRawShown = "", $g_idBtnClear
 Global $g_idBtnNow, $g_idBtnPause, $g_idBtnSet, $g_idBtnHide, $g_idBtnExit
@@ -287,14 +302,16 @@ Func _LoadSettings()
 	If $g_sClientId = "" Then $g_sClientId = "vigor-xdsl-autoit"
 	$g_sTopicBase = _CleanTopic(IniRead($INI_FILE, "mqtt", "base_topic", "vigor/xdsl"), "vigor/xdsl")
 	$g_sDiscPrefix = _CleanTopic(IniRead($INI_FILE, "mqtt", "discovery_prefix", "homeassistant"), "homeassistant")
+	$g_bMqttDiag = (Int(IniRead($INI_FILE, "mqtt", "diag_sensors", "1")) <> 0)
 	$T_STATE = $g_sTopicBase & "/state"
 	$T_AVAIL = $g_sTopicBase & "/availability"
 	$g_iInterval = Int(IniRead($INI_FILE, "general", "interval", "60"))
 	If $g_iInterval < 15 Then $g_iInterval = 15 ; do not hammer the modem
 	If $g_iInterval > 3600 Then $g_iInterval = 3600
-	$g_iAttInterval = Int(IniRead($INI_FILE, "general", "attain_interval", "300"))
-	If $g_iAttInterval < 30 Then $g_iAttInterval = 30
-	If $g_iAttInterval > 3600 Then $g_iAttInterval = 3600
+	; "ext_interval" replaces the old "attain_interval" key (still read as a fallback)
+	$g_iExtInterval = Int(IniRead($INI_FILE, "general", "ext_interval", IniRead($INI_FILE, "general", "attain_interval", "900")))
+	If $g_iExtInterval < $EXT_MIN_FACTOR * $g_iInterval Then $g_iExtInterval = $EXT_MIN_FACTOR * $g_iInterval
+	If $g_iExtInterval > 86400 Then $g_iExtInterval = 86400
 	Local $iHours = Int(IniRead($INI_FILE, "general", "ssh_max_hours", "6"))
 	If $iHours < 1 Then $iHours = 1
 	If $iHours > 48 Then $iHours = 48
@@ -383,7 +400,7 @@ EndFunc   ;==>_AutostartSet
 ; returns True if settings were saved
 Func _SettingsGui()
 	Local $bSaved = False, $bOk, $sRaw, $sStatus, $sHint, $iInterval, $sFile, $iHist, $iSsh, $iPort, $sId
-	Local $bOldT, $iOldP, $iAtt
+	Local $bOldT, $iOldP, $iExt
 	Local $bDisableMain = ($g_hMain <> 0 And $g_bWinVisible)
 	If $bDisableMain Then GUISetState(@SW_DISABLE, $g_hMain)
 	Local $hGui = GUICreate($APP_NAME & " - Settings", 410, 432)
@@ -429,6 +446,8 @@ Func _SettingsGui()
 	Local $iMDisc = GUICtrlCreateInput($g_sDiscPrefix, 135, 260, 255, 22)
 	GUICtrlCreateLabel("Changing base topic or discovery prefix re-sends the HA discovery." & _
 			" Entities under the old topics stay in HA until you delete them there.", 22, 294, 368, 44)
+	Local $iMDiag = GUICtrlCreateCheckbox("Publish diagnostic sensors (error counters, trellis, ...)", 22, 344, 368, 20)
+	If $g_bMqttDiag Then GUICtrlSetState($iMDiag, $GUI_CHECKED)
 	; --- general
 	GUICtrlCreateTabItem("General")
 	GUICtrlCreateLabel("Interval (s)", 22, 53, 110, 18)
@@ -446,9 +465,11 @@ Func _SettingsGui()
 	Local $iCsv = GUICtrlCreateCheckbox("Log every poll to a CSV file", 22, 198, 360, 20)
 	If $g_bCsv Then GUICtrlSetState($iCsv, $GUI_CHECKED)
 	GUICtrlCreateLabel("File: vigor_xdsl_monitor.csv (next to the script / exe)", 40, 222, 350, 18)
-	GUICtrlCreateLabel("Max rates every (s)", 22, 263, 110, 18)
-	Local $iAttInt = GUICtrlCreateInput($g_iAttInterval, 135, 260, 55, 22, $ES_NUMBER)
-	GUICtrlCreateLabel("30 - 3600 (reading the attainable rates takes 10+ s)", 198, 263, 195, 32)
+	GUICtrlCreateLabel("Extended data (s)", 22, 263, 110, 18)
+	Local $iExtInt = GUICtrlCreateInput($g_iExtInterval, 135, 260, 55, 22, $ES_NUMBER)
+	GUICtrlCreateLabel("min. " & $EXT_MIN_FACTOR & " x interval, max 86400", 198, 263, 195, 18)
+	GUICtrlCreateLabel("Slow query (10+ s): attainable rates, trellis, bitswap, error counters. " & _
+			"It always runs once at start and after a reconnect / resync, otherwise only this often.", 22, 290, 368, 48)
 	; --- alerts
 	GUICtrlCreateTabItem("Alerts")
 	Local $iNotify = GUICtrlCreateCheckbox("Notify on line status change and resync", 22, 48, 360, 20)
@@ -540,13 +561,15 @@ Func _SettingsGui()
 				IniWrite($INI_FILE, "mqtt", "client_id", $sId)
 				IniWrite($INI_FILE, "mqtt", "base_topic", _CleanTopic(GUICtrlRead($iMBase), "vigor/xdsl"))
 				IniWrite($INI_FILE, "mqtt", "discovery_prefix", _CleanTopic(GUICtrlRead($iMDisc), "homeassistant"))
+				IniWrite($INI_FILE, "mqtt", "diag_sensors", Int(_Chk($iMDiag)))
 				IniWrite($INI_FILE, "general", "interval", $iInterval)
 				IniWrite($INI_FILE, "general", "ssh_max_hours", $iSsh)
 				IniWrite($INI_FILE, "general", "history_len", $iHist)
-				$iAtt = Int(GUICtrlRead($iAttInt))
-				If $iAtt < 30 Then $iAtt = 30
-				If $iAtt > 3600 Then $iAtt = 3600
-				IniWrite($INI_FILE, "general", "attain_interval", $iAtt)
+				$iExt = Int(GUICtrlRead($iExtInt))
+				If $iExt < $EXT_MIN_FACTOR * $iInterval Then $iExt = $EXT_MIN_FACTOR * $iInterval
+				If $iExt > 86400 Then $iExt = 86400
+				IniWrite($INI_FILE, "general", "ext_interval", $iExt)
+				IniDelete($INI_FILE, "general", "attain_interval")
 				IniWrite($INI_FILE, "general", "start_hidden", Int(_Chk($iHid)))
 				IniWrite($INI_FILE, "general", "hide_on_close", Int(_Chk($iClose)))
 				IniWrite($INI_FILE, "general", "csv_log", Int(_Chk($iCsv)))
@@ -650,6 +673,34 @@ Func _BuildMainGui()
 	$g_idMqttS = _Row("MQTT", 317, 320, 95, 155)
 	$g_idPolls = _Row("Polls ok / failed", 317, 344, 95, 155)
 	$g_idResync = _Row("Resyncs seen", 317, 368, 95, 155)
+	GUICtrlCreateGroup("", -99, -99, 1, 1)
+	; --- line stats (extended data from the slow "show all": features, error counters)
+	GUICtrlCreateTabItem("Line stats")
+	GUICtrlCreateGroup("Line features", 20, 102, 275, 326)
+	Local $aFeat[4] = ["Trellis", "Bitswap", "ReTx", "Attenuation"]
+	For $i = 0 To 3
+		$g_aFeatId[$i] = _Row($aFeat[$i] & " (N/F)", 32, 122 + 22 * $i, 135, 115)
+	Next
+	Local $aStrCap[3] = ["Path mode (D/U)", "Interleave depth (D/U)", "Actual PSD (D/U)"]
+	For $i = 0 To 2
+		$g_aStrId[$i] = _Row($aStrCap[$i], 32, 216 + 22 * $i, 135, 115)
+	Next
+	$g_idPwr = _Row("Power mgmt mode", 32, 288, 135, 115)
+	$g_idVidR = _Row("Modem vendor ID", 32, 310, 135, 115)
+	$g_idVidC = _Row("DSLAM vendor ID", 32, 332, 135, 115)
+	$g_idExtLast = _Row("Last extended read", 32, 360, 135, 115)
+	$g_idExtNext = _Row("Next extended read", 32, 382, 135, 115)
+	GUICtrlSetColor(GUICtrlCreateLabel("N = near end, F = far end, D = down, U = up", 32, 406, 250, 16), 0x666666)
+	GUICtrlCreateGroup("", -99, -99, 1, 1)
+	GUICtrlCreateGroup("Error counters", 305, 102, 275, 326)
+	GUICtrlSetColor(GUICtrlCreateLabel("Counter", 317, 122, 105, 17), 0x666666)
+	GUICtrlSetColor(GUICtrlCreateLabel("Near end", 430, 122, 70, 17), 0x666666)
+	GUICtrlSetColor(GUICtrlCreateLabel("Far end", 505, 122, 70, 17), 0x666666)
+	For $i = 4 To 19
+		GUICtrlCreateLabel($EXT_NAMES[$i], 317, 142 + 17 * ($i - 4), 110, 17)
+		$g_aExtId[$i][0] = GUICtrlCreateLabel("-", 430, 142 + 17 * ($i - 4), 70, 17)
+		$g_aExtId[$i][1] = GUICtrlCreateLabel("-", 505, 142 + 17 * ($i - 4), 70, 17)
+	Next
 	GUICtrlCreateGroup("", -99, -99, 1, 1)
 	; --- details (firmware / device info from sysinfo)
 	GUICtrlCreateTabItem("Details")
@@ -789,6 +840,18 @@ Func _UiTick()
 	_SetTxt($g_idNext, $s)
 	If $g_bOnline And _Has($g_iUptime) Then _SetTxt($g_idUpt, _FmtUptime($g_iUptime + Int(TimerDiff($g_hUptime) / 1000)))
 	_SetTxt($g_idMonUpt, _FmtUptime(Int(TimerDiff($g_hStart) / 1000)))
+	If $g_bExtHave And $g_hExtOk <> 0 Then
+		_SetTxt($g_idExtLast, _FmtAge(TimerDiff($g_hExtOk)) & " ago")
+	Else
+		_SetTxt($g_idExtLast, "-")
+	EndIf
+	If $g_hExt = 0 Then
+		_SetTxt($g_idExtNext, "with next poll")
+	Else
+		Local $iNextMs = $g_iExtInterval * 1000 - TimerDiff($g_hExt)
+		If $iNextMs < 0 Then $iNextMs = 0
+		_SetTxt($g_idExtNext, "in " & _FmtAge($iNextMs))
+	EndIf
 	If $g_iSsh <> 0 And $g_hSshAge <> 0 Then
 		Local $sVia = "SSH"
 		If $g_iSsh < 0 Then $sVia = "Telnet"
@@ -829,10 +892,41 @@ Func _UiRefresh()
 		$g_sRawShown = $g_sLastRaw
 		GUICtrlSetData($g_idRawEdit, StringReplace(StringStripCR($g_sLastRaw), @LF, @CRLF))
 	EndIf
+	_UiExt()
 	_UiTick()
 	_DrawGraph($g_idGrRate, "Line rate (Mbit/s)", 1, "Down", "Up")
 	_DrawGraph($g_idGrSnr, "SNR (dB)", 3, "Down", "Up")
 EndFunc   ;==>_UiRefresh
+; "near / far" style pair ("-" if both are empty)
+Func _NF($a, $b)
+	If Not _Has($a) And Not _Has($b) Then Return "-"
+	Return _Dash($a) & " / " & _Dash($b)
+EndFunc   ;==>_NF
+; error counter cell: only touched when the text changes, red if it is a failure counter (kind E / H) and > 0
+Func _SetErr($id, $s, $i)
+	If $s == "" Then $s = "-"
+	If GUICtrlRead($id) == $s Then Return
+	GUICtrlSetData($id, $s)
+	Local $iClr = 0x000000
+	If StringInStr("EH", StringMid($EXT_KIND, $i + 1, 1)) And Number(StringRegExpReplace($s, "[^\d]", "")) > 0 Then $iClr = 0xC02020
+	GUICtrlSetColor($id, $iClr)
+EndFunc   ;==>_SetErr
+; "Line stats" tab
+Func _UiExt()
+	For $i = 0 To 3
+		_SetTxt($g_aFeatId[$i], _NF($g_aEnd[$i][0], $g_aEnd[$i][1]))
+	Next
+	For $i = 4 To 19
+		_SetErr($g_aExtId[$i][0], $g_aEnd[$i][0], $i)
+		_SetErr($g_aExtId[$i][1], $g_aEnd[$i][1], $i)
+	Next
+	For $i = 0 To 2
+		_SetTxt($g_aStrId[$i], _NF($g_aStr[$i][0], $g_aStr[$i][1]))
+	Next
+	_SetTxt($g_idPwr, _Dash($g_sPwrMode))
+	_SetTxt($g_idVidR, _Dash($g_sVidR))
+	_SetTxt($g_idVidC, _Dash($g_sVidC))
+EndFunc   ;==>_UiExt
 ; ---------- event log ----------
 Func _Log($s)
 	$g_sLog &= StringFormat("%02d:%02d:%02d  ", @HOUR, @MIN, @SEC) & $s & @CRLF
@@ -928,7 +1022,7 @@ Func _GfxText($hCtx, $sText, $nX, $nY, $hFont, $hFmt, $hBrush)
 EndFunc   ;==>_GfxText
 ; $iCol = history column of the first series, the second series is $iCol + 1
 Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
-	Local Const $W = 556, $h = 150, $L = 44, $R = 10, $T = 24, $B = 20
+	Local Const $W = 556, $h = 150, $L = 44, $R = 10, $T = 24, $b = 20
 	Local Const $CLR_A = 0xFF39FF88, $CLR_B = 0xFFFF4FD8 ; neon green / magenta
 	Local $hBmp = _GDIPlus_BitmapCreateFromScan0($W, $h)
 	Local $hCtx = _GDIPlus_ImageGetGraphicsContext($hBmp)
@@ -970,13 +1064,13 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 		Local $fRange = $fMax - $fMin
 		; grid + y labels
 		For $k = 0 To 3
-			$y = $T + ($h - $T - $B) * $k / 3
+			$y = $T + ($h - $T - $b) * $k / 3
 			_GDIPlus_GraphicsDrawLine($hCtx, $L, $y, $W - $R, $y, $hPenGrid)
 			_GfxText($hCtx, StringFormat("%.1f", $fMax - $fRange * $k / 3), 2, $y - 7, $hFont, $hFmt, $hBrGray)
 		Next
 		; time labels (first / last sample)
-		_GfxText($hCtx, $g_aHist[0][0], $L, $h - $B + 4, $hFont, $hFmt, $hBrGray)
-		_GfxText($hCtx, $g_aHist[$g_iHistN - 1][0], $W - $R - 32, $h - $B + 4, $hFont, $hFmt, $hBrGray)
+		_GfxText($hCtx, $g_aHist[0][0], $L, $h - $b + 4, $hFont, $hFmt, $hBrGray)
+		_GfxText($hCtx, $g_aHist[$g_iHistN - 1][0], $W - $R - 32, $h - $b + 4, $hFont, $hFmt, $hBrGray)
 		; the two series (gaps where the modem was unreachable)
 		Local $fStep = 0
 		If $g_iHistN > 1 Then $fStep = ($W - $L - $R) / ($g_iHistN - 1)
@@ -991,7 +1085,7 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 				$v = $g_aHist[$i][$iCol + $c]
 				If _Has($v) Then
 					$x = $L + $fStep * $i
-					$y = $T + ($h - $T - $B) * ($fMax - $v) / $fRange
+					$y = $T + ($h - $T - $b) * ($fMax - $v) / $fRange
 					If $bPrev Then
 						_GDIPlus_GraphicsDrawLine($hCtx, $xPrev, $yPrev, $x, $y, $hPen)
 					Else
@@ -1029,11 +1123,13 @@ Func _Alerts($sStatus, $iUptime, $vSnrDown)
 		If Not ($sNew == $g_sPrevStatus) Then
 			_Log("Line status: " & $g_sPrevStatus & " -> " & $sNew)
 			If $g_bNotify Then TrayTip($APP_NAME, "Line status: " & $g_sPrevStatus & " -> " & $sNew, 10, $TIP_ICONEXCLAMATION)
+			If StringInStr($sNew, "showtime") Then $g_hExt = 0 ; line came up -> read the extended data again
 		EndIf
 		If _Has($iUptime) And _Has($g_iPrevUptime) Then
 			If $iUptime < $g_iPrevUptime Then
 				$g_iResyncs += 1
 				_Log("Resync detected (line uptime was reset)")
+				$g_hExt = 0 ; new sync -> read the extended data again
 				If $g_bNotify Then TrayTip($APP_NAME, "Resync detected - the line uptime was reset.", 10, $TIP_ICONEXCLAMATION)
 			EndIf
 		EndIf
@@ -1069,7 +1165,8 @@ Func _ClearLive()
 	$g_vTarget = ""
 	$g_vAttD = ""
 	$g_vAttU = ""
-	$g_hAtt = 0 ; query the attainable rates again on the next successful poll
+	$g_hExt = 0 ; read the extended data again on the next successful poll (= after a reconnect)
+	_ExtClear()
 	$g_iUptime = ""
 EndFunc   ;==>_ClearLive
 ; ---------- update cycle ----------
@@ -1081,6 +1178,15 @@ Func _Update()
 	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True, True)
 	$g_bUpdating = False
 	$g_sLastRaw = $sRaw
+	If $g_bExtRan Then
+		Local $iCfg = StringInStr($sRaw, "--- config submenu ---")
+		If $iCfg Then
+			$g_sExtRaw = StringMid($sRaw, $iCfg)
+			$g_sExtRawTime = StringFormat("%02d:%02d:%02d", @HOUR, @MIN, @SEC)
+		EndIf
+	ElseIf $g_sExtRaw <> "" Then
+		$g_sLastRaw &= @CRLF & @CRLF & "--- extended data of the read at " & $g_sExtRawTime & " (not queried in this poll) ---" & @CRLF & $g_sExtRaw
+	EndIf
 	$g_bPolled = True
 	$g_sLastTime = StringFormat("%02d:%02d:%02d", @HOUR, @MIN, @SEC)
 	Local $sStatus = _Field($sRaw, "Status")
@@ -1102,13 +1208,20 @@ Func _Update()
 		Local $vSnrUp = _ToNum(_Field($sRaw, "SNR Upstream"), 1)
 		Local $vAttD = _ToNum(_StreamCell($sRaw, "Attainable Rate", 1), 1000)
 		Local $vAttU = _ToNum(_StreamCell($sRaw, "Attainable Rate", 2), 1000)
-		If Not $g_bAttRan Then ; not queried this round -> keep the last values
+		If Not $g_bExtRan Then ; not queried this round -> keep the last values
 			$vAttD = $g_vAttD
 			$vAttU = $g_vAttU
-			If Not _Has($vAttD) Then $g_hAtt = 0 ; nothing yet (e.g. after the Test button) -> query on the next poll
+		ElseIf _ParseExt($sRaw) Then
+			$g_hExtOk = TimerInit()
+			$g_iExtFail = 0
+			_Log("Extended line data read (features, error counters, attainable rates)")
+		Else
+			$g_iExtFail += 1
 		EndIf
+		; nothing yet (e.g. after the Test button, or the read failed) -> try again with the next poll,
+		; but after 3 failed reads wait for the normal extended interval (e.g. a modem without this submenu)
+		If Not $g_bExtHave And $g_iExtFail < 3 Then $g_hExt = 0
 		Local $vUptime = _UptimeSec(_Field($sRaw, "Line Uptime"))
-		Local $vMonUptime = Int(TimerDiff($g_hStart) / 1000)
 		; 35b settings (read-only): enhance is 0/1, target is a raw number
 		Local $sEnhance = _Field($sRaw, "35b_enhance status")
 		If $sEnhance = "1" Then
@@ -1128,7 +1241,6 @@ Func _Update()
 				',"snr_down":' & _JNum($vSnrDown) & ',"snr_up":' & _JNum($vSnrUp) & _
 				',"attain_down":' & _JNum($vAttD) & ',"attain_up":' & _JNum($vAttU) & _
 				',"uptime":' & _JNum($vUptime) & _
-				',"monitor_uptime":' & _JNum($vMonUptime) & _
 				',"enhance":"' & $sEnhance & '"' & _
 				',"target":' & _JNum($vTarget) & _
 				',"fw":"' & _J(_Field($sRaw, "Firmware Version")) & '"' & _
@@ -1140,7 +1252,8 @@ Func _Update()
 				',"fw_web":"' & _J(_Field($sRaw, "Web Version")) & '"' & _
 				',"fw_core":"' & _J(_Field($sRaw, "Core Version")) & '"' & _
 				',"fw_boot":"' & _J(_Field($sRaw, "Bootloader Version")) & '"' & _
-				',"fw_country":"' & _J(_Field($sRaw, "CountryCode")) & '"}'
+				',"fw_country":"' & _J(_Field($sRaw, "CountryCode")) & '"' & _
+				_ExtJson() & '}'
 		; keep the values for the window
 		$g_iPollOk += 1
 		$g_bOnline = True
@@ -1156,7 +1269,7 @@ Func _Update()
 		$g_vSnrU = $vSnrUp
 		$g_vAttD = $vAttD
 		$g_vAttU = $vAttU
-		If $g_bAttRan And Not _Has($vAttD) And Not $g_bAttWarned Then
+		If $g_bExtRan And Not _Has($vAttD) And Not $g_bAttWarned Then
 			$g_bAttWarned = True
 			_Log("Attainable rates: no 'Attainable Rate' found in the config submenu output - check the Raw tab (section '--- config submenu ---').")
 		EndIf
@@ -1208,6 +1321,7 @@ EndFunc   ;==>_TipHead
 ;             closed cleanly afterwards (used by the "Test modem" button).
 Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist = False)
 	Local $iPid, $sRaw = "", $bReused
+	$g_bExtRan = False ; set again by _SshQuery if the extended data is read in this round
 	For $iTry = 1 To 2
 		$bReused = False
 		; proactively recycle a long-lived session with a clean logout before it
@@ -1223,6 +1337,7 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist 
 			If $bPersist Then
 				$g_iSsh = $iPid
 				$g_hSshAge = TimerInit()
+				$g_hExt = 0 ; fresh session (start / reconnect / recycle) -> read the extended data now
 			EndIf
 		EndIf
 		$sRaw = _SshQuery($iPid, $bExtras)
@@ -1335,12 +1450,12 @@ Func _SshQuery($iPid, $bExtras)
 			_IoWrite($iPid, $aExtra[$c] & @CR)
 			$sAll &= _ReadUntilQuiet($iPid, 700, 5000, 3000)
 		Next
-		; attainable rates are only in the config submenu: enter it, dump the JSON, leave it again.
+		; the extended data (attainable rates, features, error counters) is only in the config submenu: enter it, dump the JSON, leave it again.
 		; Every step waits for the modem's PROMPT (typing ahead while the CLI switches menus gets swallowed),
 		; and the whole dialogue goes into the raw output so the Raw tab shows exactly what happened.
-		$g_bAttRan = ($g_hAtt = 0 Or TimerDiff($g_hAtt) >= $g_iAttInterval * 1000)
-		If $g_bAttRan Then
-			$g_hAtt = TimerInit()
+		$g_bExtRan = ($g_hExt = 0 Or TimerDiff($g_hExt) >= $g_iExtInterval * 1000)
+		If $g_bExtRan Then
+			$g_hExt = TimerInit()
 			Local $sLast, $sCfgPrompt = "(?i)\(config[^)]*\)>$"
 			_IoWrite($iPid, "config Monitoring DSL_Status Monitoring_DSL_General" & @CR)
 			$sLast = _ReadUntilPrompt($iPid, $sCfgPrompt, 6000)
@@ -1536,6 +1651,57 @@ Func _StreamCell($sRaw, $sName, $iCol)
 	If @error Then Return ""
 	Return $a[$iCol - 1]
 EndFunc   ;==>_StreamCell
+; cell of the JSON "End_Table" row $sName: $iCol 1 = Near_End, 2 = Far_End ("" if not found)
+Func _EndCell($sRaw, $sName, $iCol)
+	Local $a = StringRegExp($sRaw, '(?s)"Name":\s*"' & $sName & '",\s*"Near_End":\s*"([^"]*)",\s*"Far_End":\s*"([^"]*)"', 1)
+	If @error Then Return ""
+	Return $a[$iCol - 1]
+EndFunc   ;==>_EndCell
+; top level string value of the JSON, e.g. "ATU_R_Vendor_ID" ("" if not found)
+Func _JStr($sRaw, $sKey)
+	Local $a = StringRegExp($sRaw, '"' & $sKey & '":\s*"([^"]*)"', 1)
+	If @error Then Return ""
+	Return $a[0]
+EndFunc   ;==>_JStr
+; leading (signed) number of a text like "4.9 dB" or "0 s"; "" for "-" / empty
+Func _ToNumS($s)
+	Local $a = StringRegExp($s, "^\s*(-?\d+(?:\.\d+)?)", 1)
+	If @error Then Return ""
+	Return Number($a[0])
+EndFunc   ;==>_ToNumS
+; reads End_Table / Stream_Table / vendor IDs out of the "show all" output. False if the JSON is not in there.
+Func _ParseExt($sRaw)
+	If Not StringInStr($sRaw, '"End_Table"') Then Return False
+	For $i = 0 To 19
+		$g_aEnd[$i][0] = _EndCell($sRaw, $EXT_NAMES[$i], 1)
+		$g_aEnd[$i][1] = _EndCell($sRaw, $EXT_NAMES[$i], 2)
+	Next
+	For $i = 0 To 2
+		$g_aStr[$i][0] = _StreamCell($sRaw, $STR_NAMES[$i], 1)
+		$g_aStr[$i][1] = _StreamCell($sRaw, $STR_NAMES[$i], 2)
+	Next
+	$g_sPwrMode = _JStr($sRaw, "Power_Management_Mode")
+	$g_sVidR = _JStr($sRaw, "ATU_R_Vendor_ID")
+	$g_sVidC = _JStr($sRaw, "ATU_C_Vendor_ID")
+	$g_bExtHave = True
+	Return True
+EndFunc   ;==>_ParseExt
+; forget the extended data (line is down / reconnecting)
+Func _ExtClear()
+	For $i = 0 To 19
+		$g_aEnd[$i][0] = ""
+		$g_aEnd[$i][1] = ""
+	Next
+	For $i = 0 To 2
+		$g_aStr[$i][0] = ""
+		$g_aStr[$i][1] = ""
+	Next
+	$g_sPwrMode = ""
+	$g_sVidR = ""
+	$g_sVidC = ""
+	$g_bExtHave = False
+	$g_iExtFail = 0
+EndFunc   ;==>_ExtClear
 Func _ToNum($s, $iDiv)
 	If $s = "" Then Return ""
 	Local $sNum = StringRegExpReplace($s, "[^\d.]", "")
@@ -1560,6 +1726,37 @@ Func _JNum($v)
 	If $v == "" Then Return "null"
 	Return String($v)
 EndFunc   ;==>_JNum
+; "HEC Errors" -> "hec_errors"
+Func _ExtKey($sName)
+	Return StringLower(StringReplace($sName, " ", "_"))
+EndFunc   ;==>_ExtKey
+; extended data as extra JSON members (leading comma), the last known values are sent with every poll
+Func _ExtJson()
+	Local $s = "", $sKey
+	For $i = 0 To 19
+		$sKey = _ExtKey($EXT_NAMES[$i])
+		If Not $g_bMqttDiag And StringMid($EXT_KIND, $i + 1, 1) <> "A" Then ContinueLoop
+		If StringMid($EXT_KIND, $i + 1, 1) = "T" Then
+			If _Has($g_aEnd[$i][0]) Or _Has($g_aEnd[$i][1]) Then
+				$s &= ',"' & $sKey & '":"' & _J(_NF($g_aEnd[$i][0], $g_aEnd[$i][1])) & '"'
+			Else
+				$s &= ',"' & $sKey & '":null'
+			EndIf
+		Else
+			$s &= ',"' & $sKey & '_near":' & _JNum(_ToNumS($g_aEnd[$i][0])) & ',"' & $sKey & '_far":' & _JNum(_ToNumS($g_aEnd[$i][1]))
+		EndIf
+	Next
+	If Not $g_bMqttDiag Then Return $s
+	If _Has($g_aStr[0][0]) Or _Has($g_aStr[0][1]) Then
+		$s &= ',"path_mode":"' & _J(_NF($g_aStr[0][0], $g_aStr[0][1])) & '"'
+	Else
+		$s &= ',"path_mode":null'
+	EndIf
+	$s &= ',"interleave_depth_down":' & _JNum(_ToNumS($g_aStr[1][0])) & ',"interleave_depth_up":' & _JNum(_ToNumS($g_aStr[1][1]))
+	$s &= ',"psd_down":' & _JNum(_ToNumS($g_aStr[2][0])) & ',"psd_up":' & _JNum(_ToNumS($g_aStr[2][1]))
+	$s &= ',"power_mgmt":"' & _J($g_sPwrMode) & '","vendor_modem":"' & _J($g_sVidR) & '","vendor_dslam":"' & _J($g_sVidC) & '"'
+	Return $s
+EndFunc   ;==>_ExtJson
 ; ---------- home assistant discovery ----------
 Func _DiscoveryPackets()
 	Local $s = ""
@@ -1572,18 +1769,51 @@ Func _DiscoveryPackets()
 	$s &= _DiscPkt("snr_downstream", "DSL SNR Downstream", "snr_down", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("snr_upstream", "DSL SNR Upstream", "snr_up", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("uptime", "DSL Line Uptime", "uptime", "s", "duration", "measurement", "")
-	; diagnostic sensors (read-only)
-	$s &= _DiscPkt("monitor_uptime", "DSL Monitor Uptime", "monitor_uptime", "s", "duration", "measurement", "mdi:timer-outline", "", True)
+	; clean-up: empty retained payload removes the old "DSL Modem Uptime" entity (feature was dropped) from HA
+	$s &= _Pkt($g_sDiscPrefix & "/sensor/vigor_xdsl/modem_uptime/config", "")
+	; monitor uptime is GUI only now: remove the old entity from HA
+	$s &= _Pkt($g_sDiscPrefix & "/sensor/vigor_xdsl/monitor_uptime/config", "")
 	$s &= _DiscPkt("35b_enhance", "DSL 35b Enhance", "enhance", "", "", "", "mdi:tune", "", True)
 	$s &= _DiscPkt("35b_target", "DSL 35b Target", "target", "", "", "", "mdi:target", "", True)
 	$s &= _DiscPkt("firmware", "DSL Modem Firmware", "fw", "", "", "", "mdi:chip", _
 			"'model':value_json.fw_model,'device_name':value_json.fw_device,'build_time':value_json.fw_build," & _
 			"'branch':value_json.fw_branch,'release_mode':value_json.fw_release,'web_version':value_json.fw_web," & _
-			"'core_version':value_json.fw_core,'bootloader_version':value_json.fw_boot,'country_code':value_json.fw_country", True)
+			"'core_version':value_json.fw_core,'bootloader_version':value_json.fw_boot,'country_code':value_json.fw_country")
+	; extended line data (diagnostic sensors): read only at start / reconnect / every "extended" interval,
+	; the last values are re-sent with every poll. Rows of kind H / O ($EXT_KIND) are only in the state JSON.
+	$s &= _DiscPkt("path_mode", "DSL Path Mode", "path_mode", "", "", "", "mdi:swap-horizontal", "", True)
+	$s &= _DiscPkt("interleave_depth_down", "DSL Interleave Depth Downstream", "interleave_depth_down", "", "", "measurement", "mdi:layers-outline", "", True)
+	$s &= _DiscPkt("interleave_depth_up", "DSL Interleave Depth Upstream", "interleave_depth_up", "", "", "measurement", "mdi:layers-outline", "", True)
+	Local $sKey, $sKind, $sUnit, $sClass, $sStateClass, $sIcon
+	For $i = 0 To 19
+		$sKey = _ExtKey($EXT_NAMES[$i])
+		$sKind = StringMid($EXT_KIND, $i + 1, 1)
+		Switch $sKind
+			Case "T"
+				$s &= _DiscPkt($sKey, "DSL " & $EXT_NAMES[$i], $sKey, "", "", "", "mdi:toggle-switch-outline", "", True)
+			Case "A", "E", "N"
+				$sUnit = ""
+				$sClass = ""
+				$sStateClass = "total_increasing"
+				$sIcon = "mdi:alert-circle-outline"
+				If $sKind = "A" Then
+					$sUnit = "dB"
+					$sStateClass = "measurement"
+					$sIcon = "mdi:signal-variant"
+				ElseIf StringRegExp($EXT_NAMES[$i], "^(ES|SES|UAS)$") Then
+					$sUnit = "s"
+					$sClass = "duration"
+				EndIf
+				$s &= _DiscPkt($sKey & "_near", "DSL " & $EXT_NAMES[$i] & " Near End", $sKey & "_near", $sUnit, $sClass, $sStateClass, $sIcon, "", ($sKind <> "A"))
+				$s &= _DiscPkt($sKey & "_far", "DSL " & $EXT_NAMES[$i] & " Far End", $sKey & "_far", $sUnit, $sClass, $sStateClass, $sIcon, "", ($sKind <> "A"))
+		EndSwitch
+	Next
 	Return $s
 EndFunc   ;==>_DiscoveryPackets
 ; $sAttrs = body of a Jinja dict for the entity attributes (optional), $bDiag = show under "Diagnostic"
 Func _DiscPkt($sObj, $sName, $sField, $sUnit, $sDevClass, $sStateClass, $sIcon, $sAttrs = "", $bDiag = False)
+	; diagnostic sensors switched off: empty retained payload removes the entity from HA
+	If $bDiag And Not $g_bMqttDiag Then Return _Pkt($g_sDiscPrefix & "/sensor/vigor_xdsl/" & $sObj & "/config", "")
 	Local $iExpire = $g_iInterval * 3
 	If $iExpire < 180 Then $iExpire = 180
 	Local $s = '{"name":"' & $sName & '","unique_id":"vigor_xdsl_' & $sObj & '"' & _
