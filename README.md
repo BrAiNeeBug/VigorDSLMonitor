@@ -13,4 +13,7 @@ OUTPUT: MQTT*
 *Only use a private broker this is selfmade mqtt stuff!
 
 vigor_xdsl_monitor is stable/working
+
 vigor_xdsl_monitor2 is only for testing but it have all the new features :)
+
+(no runtime release for unstable!)
