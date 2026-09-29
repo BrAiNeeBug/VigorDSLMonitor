@@ -95,12 +95,12 @@ Settings are stored in `vigor_xdsl_monitor.ini` next to the program.
 If you change the base topic or discovery prefix, the HA discovery is sent again. Old entities stay in HA until you delete them there.
 
 ## Linux / Wine
-- `plink.exe` does not communicate under Wine, so `Auto` mode uses the built-in Telnet client. Enable Telnet on the modem for this.
+- `plink.exe` does not communicate under Wine, so `Auto` mode uses the built-in Telnet client.
 - Telnet is unencrypted. Use it only inside your LAN.
 - The first tray menu entry (the app name) does nothing on purpose. It works around a tray menu bug under Wine.
 
 ## Known limitations
-- The modem's system uptime is not available (no CLI command found so far). It is only shown in the modem's web UI.
+- The modem's system uptime is not available (no CLI command found so far).
 - MQTT: QoS 0, no TLS.
 
 ## Links
