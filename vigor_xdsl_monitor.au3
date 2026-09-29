@@ -2,7 +2,7 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.3.0.0
+#AutoIt3Wrapper_Res_Fileversion=0.3.1.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -33,7 +33,7 @@ Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
 Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.3)"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
-Global Const $APP_VER = "0.3.0"
+Global Const $APP_VER = "0.3.1"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -96,6 +96,7 @@ Global $g_iReq = 0 ; button pressed (queued), executed by the main loop and neve
 Global $g_hShown = 0 ; timer: window was just shown (Wine fires bogus close/minimize events then)
 Global $g_bWine = False
 Global $g_idLnk = 0
+Global $g_hGfxFam = 0, $g_hGfxFont = 0, $g_bGfxGeneric = False, $g_bGfxWarned = False ; graph font (created once)
 Global $g_idHdr, $g_idSub, $g_idTab, $g_idTiRaw
 Global $g_idDown, $g_idUp, $g_idSnrD, $g_idSnrU
 Global $g_idAttD, $g_idAttU, $g_idMonUpt, $g_idUpt, $g_idMode, $g_idProf, $g_idAnnex, $g_idDslV, $g_idEnh, $g_idTgt
@@ -181,6 +182,8 @@ Func _Exit()
 	If $g_bRunning Then _Publish(_Pkt($T_AVAIL, "offline"))
 	_SshDrop()
 	TCPShutdown()
+	If $g_hGfxFont <> 0 Then _GDIPlus_FontDispose($g_hGfxFont)
+	If $g_hGfxFam <> 0 And Not $g_bGfxGeneric Then _GDIPlus_FontFamilyDispose($g_hGfxFam)
 	_GDIPlus_Shutdown()
 EndFunc   ;==>_Exit
 ; ---------- events ----------
@@ -885,9 +888,43 @@ Func _CsvLog($sStatus, $vDown, $vUp, $vSnrDown, $vSnrUp, $iUptime)
 	FileClose($hFile)
 EndFunc   ;==>_CsvLog
 ; ---------- graphs (GDI+ into a bitmap, shown in a picture control) ----------
+; creates the graph font once. Tries Arial first (identical look on Windows), then fonts that exist
+; in a typical Wine prefix, finally the generic sans-serif family. Returns False if nothing works.
+Func _GfxFontInit()
+	If $g_hGfxFont <> 0 Then Return True
+	If $g_hGfxFam = 0 Then
+		Local $aNames[6] = ["Arial", "Liberation Sans", "DejaVu Sans", "Tahoma", "Microsoft Sans Serif", "Segoe UI"]
+		Local $h
+		For $i = 0 To UBound($aNames) - 1
+			$h = _GDIPlus_FontFamilyCreate($aNames[$i])
+			If Not @error And $h <> 0 Then
+				$g_hGfxFam = $h
+				ExitLoop
+			EndIf
+		Next
+		If $g_hGfxFam = 0 Then
+			Local $aR = DllCall("gdiplus.dll", "int", "GdipGetGenericFontFamilySansSerif", "ptr*", 0)
+			If Not @error And $aR[0] = 0 And $aR[1] <> 0 Then
+				$g_hGfxFam = $aR[1]
+				$g_bGfxGeneric = True
+			EndIf
+		EndIf
+	EndIf
+	If $g_hGfxFam <> 0 Then $g_hGfxFont = _GDIPlus_FontCreate($g_hGfxFam, 8)
+	If $g_hGfxFont = 0 And Not $g_bGfxWarned Then
+		$g_bGfxWarned = True
+		_Log("Graph text: no usable font found, the graphs are drawn without labels")
+	EndIf
+	Return ($g_hGfxFont <> 0)
+EndFunc   ;==>_GfxFontInit
 Func _GfxText($hCtx, $sText, $nX, $nY, $hFont, $hFmt, $hBrush)
-	Local $tLayout = _GDIPlus_RectFCreate($nX, $nY, 0, 0)
-	_GDIPlus_GraphicsDrawStringEx($hCtx, $sText, $hFont, $tLayout, $hFmt, $hBrush)
+	If $hFont = 0 Then Return
+	; real layout size: a 0 x 0 rect gets clipped away completely under Wine
+	Local $tLayout = _GDIPlus_RectFCreate($nX, $nY, 150, 18)
+	If Not _GDIPlus_GraphicsDrawStringEx($hCtx, $sText, $hFont, $tLayout, $hFmt, $hBrush) And Not $g_bGfxWarned Then
+		$g_bGfxWarned = True
+		_Log("Graph text: GDI+ DrawString failed (error " & @error & " / " & @extended & ")")
+	EndIf
 EndFunc   ;==>_GfxText
 ; $iCol = history column of the first series, the second series is $iCol + 1
 Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
@@ -897,8 +934,9 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 	Local $hCtx = _GDIPlus_ImageGetGraphicsContext($hBmp)
 	_GDIPlus_GraphicsSetSmoothingMode($hCtx, 2)
 	_GDIPlus_GraphicsClear($hCtx, 0xFF15181E)
-	Local $hFam = _GDIPlus_FontFamilyCreate("Arial")
-	Local $hFont = _GDIPlus_FontCreate($hFam, 8)
+	_GfxFontInit()
+	Local $hFont = $g_hGfxFont
+	If $g_bWine Then _GDIPlus_GraphicsSetTextRenderingHint($hCtx, 3) ; AntiAliasGridFit: ClearType on an ARGB bitmap is unreliable in Wine
 	Local $hFmt = _GDIPlus_StringFormatCreate()
 	Local $hBrGray = _GDIPlus_BrushCreateSolid(0xFF8A94A3)
 	Local $hBrA = _GDIPlus_BrushCreateSolid($CLR_A)
@@ -979,8 +1017,6 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 	_GDIPlus_BrushDispose($hBrA)
 	_GDIPlus_BrushDispose($hBrB)
 	_GDIPlus_StringFormatDispose($hFmt)
-	_GDIPlus_FontDispose($hFont)
-	_GDIPlus_FontFamilyDispose($hFam)
 	_GDIPlus_GraphicsDispose($hCtx)
 	_GDIPlus_BitmapDispose($hBmp)
 EndFunc   ;==>_DrawGraph
