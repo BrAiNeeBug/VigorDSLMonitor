@@ -20,4 +20,6 @@ vigor_xdsl_monitor2 is only for testing but it have all the new features :)
 
 
 Using:
-run the exe file or compile your own runtime/exe, just download autoit > load the .au3 file > press F7(Compile) > Done...
+run the exe file or compile your own runtime/exe
+
+Just download autoit > load the .au3 file > press F7(Compile) > Done...
