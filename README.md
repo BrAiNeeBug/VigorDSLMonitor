@@ -97,7 +97,6 @@ If you change the base topic or discovery prefix, the HA discovery is sent again
 ## Linux / Wine
 - `plink.exe` does not communicate under Wine, so `Auto` mode uses the built-in Telnet client. Enable Telnet on the modem for this.
 - Telnet is unencrypted. Use it only inside your LAN.
-- Known issue: under Wine the window may close right after opening it. This does not happen on Windows. The Log tab shows which event hid the window.
 - The first tray menu entry (the app name) does nothing on purpose. It works around a tray menu bug under Wine.
 
 ## Known limitations
