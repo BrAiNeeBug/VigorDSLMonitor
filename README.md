@@ -5,9 +5,10 @@ Do a onetime connection with plink to your Device then you can start the monitor
 known issues: laggy interface/traymenue // sshserver-behavior(current test 25.09.2026)
 
 Tested: Windows (SSH Working), Linux Wine (Telnet Working) other Modes-Combinations are untested...
+
 Connection:
-INPUT: Modem (SSH)
-OUTPUT: MQTT*
+INPUT: Modem (SSH/TELNET)
+OUTPUT: GUI/MQTT*
 
 *Only use a private broker this is selfmade mqtt stuff!
 
