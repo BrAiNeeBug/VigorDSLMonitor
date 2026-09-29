@@ -2,7 +2,7 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.2.0.0
+#AutoIt3Wrapper_Res_Fileversion=0.3.0.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -21,6 +21,7 @@
 #include <GUIConstantsEx.au3>
 #include <EditConstants.au3>
 #include <ButtonConstants.au3>
+#include <ComboConstants.au3>
 #include <StaticConstants.au3>
 #include <WindowsConstants.au3>
 #include <MsgBoxConstants.au3>
@@ -30,8 +31,9 @@
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
-Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.2)"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.3)"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
+Global Const $APP_VER = "0.3.0"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -41,6 +43,8 @@ Global Const $HIST_CAP = 2000 ; hard upper limit for the history buffer
 Global $T_STATE, $T_AVAIL
 ; settings (loaded from INI)
 Global $g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink
+; connection method: "auto" (Telnet under Wine, SSH/plink on Windows), "ssh" or "telnet"
+Global $g_sMethod = "auto", $g_bTelnet = False, $g_iTelnetPort = 23
 Global $g_sMqttHost, $g_iMqttPort, $g_sMqttUser, $g_sMqttPass
 Global $g_bMqttOn, $g_sClientId, $g_sTopicBase, $g_sDiscPrefix
 Global $g_bPassErr = False ; True if a stored password could not be decrypted (e.g. INI copied from another PC/user)
@@ -50,7 +54,7 @@ Global $g_fSnrAlert ; 0 = off
 ; runtime state
 Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
 Global $g_sLastRaw = "", $g_sMqttErr = "", $g_sModel = "" ; $g_sModel = model name read from the modem (for the HA device)
-Global $g_idApp, $g_idShow, $g_idNow, $g_idPause, $g_idRaw, $g_idSettings, $g_idExit
+Global $g_idApp, $g_idShow, $g_idExit
 Global $g_hPoll, $g_hTick
 ; persistent SSH session to the modem (PID of plink, 0 = no session)
 Global $g_iSsh = 0, $g_sSshErr = ""
@@ -66,7 +70,12 @@ Global Const $PLINK_URLS[2] = [ _
 Global $g_bPolled = False, $g_bOnline = False, $g_bUpdating = False
 Global $g_sStatus = "", $g_sMode = "", $g_sProfile = "", $g_sAnnex = "", $g_sDslVer = "", $g_sEnhance = ""
 Global $g_vDown = "", $g_vUp = "", $g_vSnrD = "", $g_vSnrU = "", $g_vTarget = ""
+Global $g_vAttD = "", $g_vAttU = "" ; attainable (max) line rate
+Global $g_bAttWarned = False
+; the attainable rates take 10+ s to read ("show all"), so they are only queried every $g_iAttInterval seconds
+Global $g_iAttInterval = 300, $g_hAtt = 0, $g_bAttRan = False
 Global $g_iUptime = "", $g_hUptime = 0
+Global $g_hStart = TimerInit() ; start of this program = monitor uptime
 Global $g_sLastTime = "-", $g_sMqttState = "-", $g_sMqttPrevErr = ""
 Global $g_iPollOk = 0, $g_iPollFail = 0, $g_iResyncs = 0
 Global Const $FW_KEYS[10] = ["Model Name", "Device Name", "Firmware Version", "Build Time", "Branch", _
@@ -82,9 +91,14 @@ Global $g_aHist[$HIST_CAP][5], $g_iHistN = 0
 Global $g_sLog = ""
 ; window handles / control ids
 Global $g_hMain = 0, $g_bWinVisible = False
+Global $g_bBusy = False ; True while a poll runs: long waits keep window + tray alive via _Yield()
+Global $g_iReq = 0 ; button pressed (queued), executed by the main loop and never inside a poll
+Global $g_hShown = 0 ; timer: window was just shown (Wine fires bogus close/minimize events then)
+Global $g_bWine = False
+Global $g_idLnk = 0
 Global $g_idHdr, $g_idSub, $g_idTab, $g_idTiRaw
 Global $g_idDown, $g_idUp, $g_idSnrD, $g_idSnrU
-Global $g_idUpt, $g_idMode, $g_idProf, $g_idAnnex, $g_idDslV, $g_idEnh, $g_idTgt
+Global $g_idAttD, $g_idAttU, $g_idMonUpt, $g_idUpt, $g_idMode, $g_idProf, $g_idAnnex, $g_idDslV, $g_idEnh, $g_idTgt
 Global $g_idLast, $g_idNext, $g_idSsh, $g_idMqttS, $g_idPolls, $g_idResync
 Global $g_aFwId[10]
 Global $g_idGrRate, $g_idGrSnr
@@ -98,6 +112,7 @@ If Not FileExists($INI_FILE) Then
 		FileCopy(@ScriptDir & "\vigor167-dsl.ini", $INI_FILE)
 	EndIf
 EndIf
+$g_bWine = _IsWine()
 _LoadSettings()
 TCPStartup()
 _GDIPlus_Startup()
@@ -118,11 +133,7 @@ $g_idApp = TrayCreateItem($APP_NAME)
 TrayCreateItem("")
 $g_idShow = TrayCreateItem("Show window")
 TrayItemSetState($g_idShow, $TRAY_DEFAULT)
-$g_idNow = TrayCreateItem("Update now")
-$g_idPause = TrayCreateItem("Pause polling")
-$g_idRaw = TrayCreateItem("Show last raw output")
 TrayCreateItem("")
-$g_idSettings = TrayCreateItem("Settings...")
 $g_idExit = TrayCreateItem("Exit")
 TraySetToolTip($APP_NAME)
 $g_bRunning = True
@@ -132,47 +143,22 @@ If Not $g_bStartHidden Then _WinShow()
 _Update()
 $g_hPoll = TimerInit()
 $g_hTick = TimerInit()
+Local $iReq
 While True
-	Switch TrayGetMsg()
-		Case $g_idApp
-			ShellExecute($APP_URL)
-		Case $g_idShow, $TRAY_EVENT_PRIMARYDOUBLE
-			_WinShow()
-		Case $g_idNow
-			_PollNow()
-		Case $g_idPause
-			_TogglePause()
-		Case $g_idRaw
-			_WinShow()
-			GUICtrlSetState($g_idTiRaw, $GUI_SHOW)
-		Case $g_idSettings
-			_DoSettings()
-		Case $g_idExit
-			ExitLoop
-	EndSwitch
-	Switch GUIGetMsg()
-		Case $GUI_EVENT_CLOSE
-			If $g_bHideOnClose Then
-				_WinHide()
-			Else
-				ExitLoop
-			EndIf
-		Case $GUI_EVENT_MINIMIZE
-			If $g_bHideOnClose Then _WinHide()
-		Case $g_idBtnNow
-			_PollNow()
-		Case $g_idBtnPause
-			_TogglePause()
-		Case $g_idBtnSet
-			_DoSettings()
-		Case $g_idBtnHide
-			_WinHide()
-		Case $g_idBtnClear
-			$g_sLog = ""
-			GUICtrlSetData($g_idLog, "")
-		Case $g_idBtnExit
-			ExitLoop
-	EndSwitch
+	If Not _HandleEvents() Then ExitLoop
+	; buttons queued by _HandleEvents run here, outside of any poll
+	If $g_iReq <> 0 Then
+		$iReq = $g_iReq
+		$g_iReq = 0
+		Switch $iReq
+			Case $g_idBtnNow
+				_PollNow()
+			Case $g_idBtnPause
+				_TogglePause()
+			Case $g_idBtnSet
+				_DoSettings()
+		EndSwitch
+	EndIf
 	If Not $g_bPaused And TimerDiff($g_hPoll) >= $g_iInterval * 1000 Then
 		_Update()
 		$g_hPoll = TimerInit()
@@ -181,16 +167,99 @@ While True
 		_UiTick()
 		$g_hTick = TimerInit()
 	EndIf
-	Sleep(50)
+	; idle: short sleep while the window is open, longer while it sits in the tray (saves CPU)
+	If $g_bWinVisible Then
+		Sleep(30)
+	Else
+		Sleep(150)
+	EndIf
 WEnd
 Exit
 Func _Exit()
+	$g_bBusy = False ; no GUI pumping while shutting down
 	; mark sensors unavailable on a clean exit (retained availability topic)
 	If $g_bRunning Then _Publish(_Pkt($T_AVAIL, "offline"))
 	_SshDrop()
 	TCPShutdown()
 	_GDIPlus_Shutdown()
 EndFunc   ;==>_Exit
+; ---------- events ----------
+; Handles tray + window events. Returns False when the program should quit.
+; Never runs anything slow itself (Update / Pause / Settings are only queued in $g_iReq),
+; so it is safe to call from inside a running poll.
+Func _HandleEvents()
+	Local $iMsg = TrayGetMsg()
+	Switch $iMsg
+		Case $g_idShow, $TRAY_EVENT_PRIMARYDOUBLE
+			_WinShow()
+		Case $g_idExit
+			Return False
+	EndSwitch
+	$iMsg = GUIGetMsg()
+	Switch $iMsg
+		Case 0
+			; nothing
+		Case $GUI_EVENT_CLOSE
+			If Not _JustShown("close") Then
+				If $g_bHideOnClose Then
+					_WinHide("close button")
+				Else
+					Return False
+				EndIf
+			EndIf
+		Case $GUI_EVENT_MINIMIZE
+			; only react to a REAL minimize (Wine can send this right after showing the window)
+			If $g_bHideOnClose And Not _JustShown("minimize") Then
+				If BitAND(WinGetState($g_hMain), 16) Then _WinHide("minimize")
+			EndIf
+		Case $g_idBtnNow, $g_idBtnPause, $g_idBtnSet
+			$g_iReq = $iMsg
+		Case $g_idBtnHide
+			_WinHide("Hide button")
+		Case $g_idBtnClear
+			$g_sLog = ""
+			GUICtrlSetData($g_idLog, "")
+		Case $g_idLnk
+			ShellExecute($APP_URL)
+		Case $g_idBtnExit
+			Return False
+	EndSwitch
+	Return True
+EndFunc   ;==>_HandleEvents
+; True during the first 700 ms after the window was shown: close/minimize events in that time are bogus
+Func _JustShown($sEvent)
+	If $g_hShown = 0 Or TimerDiff($g_hShown) > 700 Then Return False
+	If $g_bWine Then _Log("Ignored " & $sEvent & " event right after showing the window")
+	Return True
+EndFunc   ;==>_JustShown
+; called from inside the long waits of a poll: keeps window and tray responsive
+Func _Yield()
+	If Not $g_bBusy Then Return
+	If Not _HandleEvents() Then Exit ; _Exit cleans up
+	If TimerDiff($g_hTick) >= 1000 Then
+		_UiTick()
+		$g_hTick = TimerInit()
+	EndIf
+EndFunc   ;==>_Yield
+; Sleep that keeps the GUI alive while a poll is running
+Func _Nap($iMs)
+	If Not $g_bBusy Then
+		Sleep($iMs)
+		Return
+	EndIf
+	Local $h = TimerInit()
+	Do
+		_Yield()
+		Sleep(20)
+	Until TimerDiff($h) >= $iMs
+EndFunc   ;==>_Nap
+; like ProcessWaitClose, but keeps the GUI alive
+Func _WaitClose($iPid, $iSec)
+	Local $h = TimerInit()
+	While ProcessExists($iPid) And TimerDiff($h) < $iSec * 1000
+		_Nap(50)
+	WEnd
+EndFunc   ;==>_WaitClose
 ; ---------- settings ----------
 Func _LoadSettings()
 	$g_bPassErr = False
@@ -199,6 +268,11 @@ Func _LoadSettings()
 	$g_sModemPass = _Unprotect(IniRead($INI_FILE, "modem", "pass", ""))
 	If @error Then $g_bPassErr = True
 	$g_sPlink = IniRead($INI_FILE, "modem", "plink", @ScriptDir & "\plink.exe")
+	$g_sMethod = StringLower(StringStripWS(IniRead($INI_FILE, "modem", "method", "auto"), 3))
+	If Not StringRegExp($g_sMethod, "^(auto|ssh|telnet)$") Then $g_sMethod = "auto"
+	$g_bTelnet = _UseTelnet($g_sMethod)
+	$g_iTelnetPort = Int(IniRead($INI_FILE, "modem", "telnet_port", "23"))
+	If $g_iTelnetPort < 1 Or $g_iTelnetPort > 65535 Then $g_iTelnetPort = 23
 	$g_bMqttOn = (Int(IniRead($INI_FILE, "mqtt", "enabled", "1")) <> 0)
 	$g_sMqttHost = IniRead($INI_FILE, "mqtt", "host", "homeassistant.local")
 	$g_iMqttPort = Int(IniRead($INI_FILE, "mqtt", "port", "1883"))
@@ -215,6 +289,9 @@ Func _LoadSettings()
 	$g_iInterval = Int(IniRead($INI_FILE, "general", "interval", "60"))
 	If $g_iInterval < 15 Then $g_iInterval = 15 ; do not hammer the modem
 	If $g_iInterval > 3600 Then $g_iInterval = 3600
+	$g_iAttInterval = Int(IniRead($INI_FILE, "general", "attain_interval", "300"))
+	If $g_iAttInterval < 30 Then $g_iAttInterval = 30
+	If $g_iAttInterval > 3600 Then $g_iAttInterval = 3600
 	Local $iHours = Int(IniRead($INI_FILE, "general", "ssh_max_hours", "6"))
 	If $iHours < 1 Then $iHours = 1
 	If $iHours > 48 Then $iHours = 48
@@ -229,6 +306,26 @@ Func _LoadSettings()
 	$g_fSnrAlert = Number(IniRead($INI_FILE, "general", "snr_alert", "0"))
 	If $g_fSnrAlert < 0 Then $g_fSnrAlert = 0
 EndFunc   ;==>_LoadSettings
+; True when running under Wine (ntdll exports wine_get_version there, real Windows does not)
+Func _IsWine()
+	DllCall("ntdll.dll", "str:cdecl", "wine_get_version")
+	Return Not @error
+EndFunc   ;==>_IsWine
+Func _UseTelnet($sKey)
+	If $sKey = "telnet" Then Return True
+	If $sKey = "ssh" Then Return False
+	Return $g_bWine
+EndFunc   ;==>_UseTelnet
+Func _MethodName($sKey)
+	If $sKey = "ssh" Then Return "SSH (plink)"
+	If $sKey = "telnet" Then Return "Telnet (built-in)"
+	Return "Auto"
+EndFunc   ;==>_MethodName
+Func _MethodKey($sText)
+	If StringLeft($sText, 3) = "SSH" Then Return "ssh"
+	If StringLeft($sText, 6) = "Telnet" Then Return "telnet"
+	Return "auto"
+EndFunc   ;==>_MethodKey
 ; trims slashes/spaces, falls back to $sDefault if empty or containing MQTT wildcards
 Func _CleanTopic($s, $sDefault)
 	$s = StringRegExpReplace(StringStripWS($s, 3), "^/+|/+$", "")
@@ -283,6 +380,7 @@ EndFunc   ;==>_AutostartSet
 ; returns True if settings were saved
 Func _SettingsGui()
 	Local $bSaved = False, $bOk, $sRaw, $sStatus, $sHint, $iInterval, $sFile, $iHist, $iSsh, $iPort, $sId
+	Local $bOldT, $iOldP, $iAtt
 	Local $bDisableMain = ($g_hMain <> 0 And $g_bWinVisible)
 	If $bDisableMain Then GUISetState(@SW_DISABLE, $g_hMain)
 	Local $hGui = GUICreate($APP_NAME & " - Settings", 410, 432)
@@ -302,6 +400,12 @@ Func _SettingsGui()
 	Local $iSshH = GUICtrlCreateInput(Round($g_iSshMaxAge / 3600000), 135, 180, 55, 22, $ES_NUMBER)
 	GUICtrlCreateLabel("The persistent SSH session is closed cleanly and re-opened after this many hours (1-48)." & _
 			" Keeps the modem's SSH/PTY slots from filling up.", 22, 212, 368, 44)
+	GUICtrlCreateLabel("Connection", 22, 273, 110, 18)
+	Local $iConn = GUICtrlCreateCombo("", 135, 270, 255, 22, $CBS_DROPDOWNLIST)
+	GUICtrlSetData($iConn, "Auto|SSH (plink)|Telnet (built-in)", _MethodName($g_sMethod))
+	GUICtrlCreateLabel("Telnet port", 22, 303, 110, 18)
+	Local $iTPort = GUICtrlCreateInput($g_iTelnetPort, 135, 300, 55, 22, $ES_NUMBER)
+	GUICtrlCreateLabel("Auto = Telnet under Wine, SSH on Windows", 198, 303, 195, 18)
 	; --- mqtt
 	GUICtrlCreateTabItem("MQTT")
 	Local $iMOn = GUICtrlCreateCheckbox("Publish to MQTT / Home Assistant", 22, 48, 360, 20)
@@ -339,6 +443,9 @@ Func _SettingsGui()
 	Local $iCsv = GUICtrlCreateCheckbox("Log every poll to a CSV file", 22, 198, 360, 20)
 	If $g_bCsv Then GUICtrlSetState($iCsv, $GUI_CHECKED)
 	GUICtrlCreateLabel("File: vigor_xdsl_monitor.csv (next to the script / exe)", 40, 222, 350, 18)
+	GUICtrlCreateLabel("Max rates every (s)", 22, 263, 110, 18)
+	Local $iAttInt = GUICtrlCreateInput($g_iAttInterval, 135, 260, 55, 22, $ES_NUMBER)
+	GUICtrlCreateLabel("30 - 3600 (reading the attainable rates takes 10+ s)", 198, 263, 195, 32)
 	; --- alerts
 	GUICtrlCreateTabItem("Alerts")
 	Local $iNotify = GUICtrlCreateCheckbox("Notify on line status change and resync", 22, 48, 360, 20)
@@ -362,7 +469,14 @@ Func _SettingsGui()
 				If Not @error Then GUICtrlSetData($iPlink, $sFile)
 			Case $iTestModem
 				GUISetCursor(15, 1)
-				$sRaw = _FetchDslInfo(GUICtrlRead($iHost), GUICtrlRead($iUser), GUICtrlRead($iPass), GUICtrlRead($iPlink))
+				$bOldT = $g_bTelnet
+				$iOldP = $g_iTelnetPort
+				$g_bTelnet = _UseTelnet(_MethodKey(GUICtrlRead($iConn)))
+				$g_iTelnetPort = Int(GUICtrlRead($iTPort))
+				If $g_iTelnetPort < 1 Or $g_iTelnetPort > 65535 Then $g_iTelnetPort = 23
+				$sRaw = _FetchDslInfo(GUICtrlRead($iHost), GUICtrlRead($iUser), GUICtrlRead($iPass), GUICtrlRead($iPlink), True)
+				$g_bTelnet = $bOldT
+				$g_iTelnetPort = $iOldP
 				GUISetCursor(2, 0)
 				$sStatus = _Field($sRaw, "Status")
 				If $sStatus <> "" Then
@@ -413,6 +527,8 @@ Func _SettingsGui()
 				IniWrite($INI_FILE, "modem", "user", GUICtrlRead($iUser))
 				IniWrite($INI_FILE, "modem", "pass", _Protect(GUICtrlRead($iPass)))
 				IniWrite($INI_FILE, "modem", "plink", GUICtrlRead($iPlink))
+				IniWrite($INI_FILE, "modem", "method", _MethodKey(GUICtrlRead($iConn)))
+				IniWrite($INI_FILE, "modem", "telnet_port", Int(GUICtrlRead($iTPort)))
 				IniWrite($INI_FILE, "mqtt", "enabled", Int(_Chk($iMOn)))
 				IniWrite($INI_FILE, "mqtt", "host", StringStripWS(GUICtrlRead($iMHost), 3))
 				IniWrite($INI_FILE, "mqtt", "port", $iPort)
@@ -424,6 +540,10 @@ Func _SettingsGui()
 				IniWrite($INI_FILE, "general", "interval", $iInterval)
 				IniWrite($INI_FILE, "general", "ssh_max_hours", $iSsh)
 				IniWrite($INI_FILE, "general", "history_len", $iHist)
+				$iAtt = Int(GUICtrlRead($iAttInt))
+				If $iAtt < 30 Then $iAtt = 30
+				If $iAtt > 3600 Then $iAtt = 3600
+				IniWrite($INI_FILE, "general", "attain_interval", $iAtt)
 				IniWrite($INI_FILE, "general", "start_hidden", Int(_Chk($iHid)))
 				IniWrite($INI_FILE, "general", "hide_on_close", Int(_Chk($iClose)))
 				IniWrite($INI_FILE, "general", "csv_log", Int(_Chk($iCsv)))
@@ -463,14 +583,12 @@ EndFunc   ;==>_PollNow
 Func _TogglePause()
 	$g_bPaused = Not $g_bPaused
 	If $g_bPaused Then
-		TrayItemSetText($g_idPause, "Resume polling")
 		GUICtrlSetData($g_idBtnPause, "Resume")
 		TraySetToolTip($APP_NAME & " - paused")
 		_SshDrop() ; free the modem's SSH slot while paused
 		_Log("Polling paused")
 		_UiRefresh()
 	Else
-		TrayItemSetText($g_idPause, "Pause polling")
 		GUICtrlSetData($g_idBtnPause, "Pause")
 		_Log("Polling resumed")
 		_Update()
@@ -511,21 +629,24 @@ Func _BuildMainGui()
 	GUICtrlSetFont($g_idSnrU, 16, 700, 0, "Segoe UI")
 	GUICtrlCreateGroup("", -99, -99, 1, 1)
 	GUICtrlCreateGroup("Line", 20, 196, 275, 232)
-	$g_idUpt = _Row("Line uptime", 32, 226, 90, 160)
-	$g_idMode = _Row("Mode", 32, 252, 90, 160)
-	$g_idProf = _Row("Profile", 32, 278, 90, 160)
-	$g_idAnnex = _Row("Annex", 32, 304, 90, 160)
-	$g_idDslV = _Row("DSL version", 32, 330, 90, 160)
-	$g_idEnh = _Row("35b enhance", 32, 356, 90, 160)
-	$g_idTgt = _Row("35b target", 32, 382, 90, 160)
+	$g_idUpt = _Row("Line uptime", 32, 222, 100, 150)
+	$g_idAttD = _Row("Max down", 32, 244, 100, 150)
+	$g_idAttU = _Row("Max up", 32, 266, 100, 150)
+	$g_idMode = _Row("Mode", 32, 288, 100, 150)
+	$g_idProf = _Row("Profile", 32, 310, 100, 150)
+	$g_idAnnex = _Row("Annex", 32, 332, 100, 150)
+	$g_idDslV = _Row("DSL version", 32, 354, 100, 150)
+	$g_idEnh = _Row("35b enhance", 32, 376, 100, 150)
+	$g_idTgt = _Row("35b target", 32, 398, 100, 150)
 	GUICtrlCreateGroup("", -99, -99, 1, 1)
-	GUICtrlCreateGroup("Monitor", 305, 196, 275, 232)
-	$g_idLast = _Row("Last update", 317, 226, 95, 155)
-	$g_idNext = _Row("Next update in", 317, 252, 95, 155)
-	$g_idSsh = _Row("Modem SSH", 317, 278, 95, 155)
-	$g_idMqttS = _Row("MQTT", 317, 304, 95, 155)
-	$g_idPolls = _Row("Polls ok / failed", 317, 330, 95, 155)
-	$g_idResync = _Row("Resyncs seen", 317, 356, 95, 155)
+	GUICtrlCreateGroup("Modem / monitor", 305, 196, 275, 232)
+	$g_idMonUpt = _Row("Monitor uptime", 317, 224, 95, 155)
+	$g_idLast = _Row("Last update", 317, 248, 95, 155)
+	$g_idNext = _Row("Next update in", 317, 272, 95, 155)
+	$g_idSsh = _Row("Connection", 317, 296, 95, 155)
+	$g_idMqttS = _Row("MQTT", 317, 320, 95, 155)
+	$g_idPolls = _Row("Polls ok / failed", 317, 344, 95, 155)
+	$g_idResync = _Row("Resyncs seen", 317, 368, 95, 155)
 	GUICtrlCreateGroup("", -99, -99, 1, 1)
 	; --- details (firmware / device info from sysinfo)
 	GUICtrlCreateTabItem("Details")
@@ -548,6 +669,22 @@ Func _BuildMainGui()
 	$g_idTiRaw = GUICtrlCreateTabItem("Raw")
 	$g_idRawEdit = GUICtrlCreateEdit("", 20, 102, 560, 326, BitOR($ES_READONLY, $WS_VSCROLL, $ES_AUTOVSCROLL))
 	GUICtrlSetFont($g_idRawEdit, 9, 400, 0, "Consolas")
+	; --- about
+	GUICtrlCreateTabItem("About")
+	Local $idAbT = GUICtrlCreateLabel("Vigor-xDSL-Monitor", 32, 118, 540, 34)
+	GUICtrlSetFont($idAbT, 18, 700, 0, "Segoe UI")
+	GUICtrlCreateLabel("Reads the DSL status of DrayTek Vigor modems (SSH / Telnet) and publishes it to Home Assistant via MQTT.", 32, 158, 540, 36)
+	Local $sVer = $APP_VER
+	If @Compiled Then $sVer &= "  (build " & FileGetVersion(@ScriptFullPath) & ")"
+	GUICtrlSetData(_Row("Version", 32, 212, 100, 440), $sVer)
+	GUICtrlSetData(_Row("Author", 32, 236, 100, 440), "BrAiNee")
+	GUICtrlCreateLabel("GitHub", 32, 260, 100, 18)
+	$g_idLnk = GUICtrlCreateLabel($APP_URL, 136, 260, 440, 18)
+	GUICtrlSetColor($g_idLnk, 0x0066CC)
+	GUICtrlSetFont($g_idLnk, 9, 400, 4, "Segoe UI")
+	GUICtrlSetCursor($g_idLnk, 0) ; hand
+	GUICtrlSetData(_Row("System", 32, 284, 100, 440), _RuntimeInfo())
+	GUICtrlSetData(_Row("AutoIt", 32, 308, 100, 440), @AutoItVersion)
 	GUICtrlCreateTabItem("")
 	$g_idBtnNow = GUICtrlCreateButton("Update now", 10, 448, 100, 30)
 	$g_idBtnPause = GUICtrlCreateButton("Pause", 115, 448, 100, 30)
@@ -555,14 +692,25 @@ Func _BuildMainGui()
 	$g_idBtnHide = GUICtrlCreateButton("Hide to tray", 380, 448, 100, 30)
 	$g_idBtnExit = GUICtrlCreateButton("Exit", 490, 448, 100, 30)
 EndFunc   ;==>_BuildMainGui
+; OS / Wine info for the About tab (handy for bug reports)
+Func _RuntimeInfo()
+	Local $s = @OSVersion & " " & @OSArch
+	If $g_bWine Then
+		Local $aW = DllCall("ntdll.dll", "str:cdecl", "wine_get_version")
+		If Not @error Then $s &= "  (Wine " & $aW[0] & ")"
+	EndIf
+	Return $s
+EndFunc   ;==>_RuntimeInfo
 Func _WinShow()
+	$g_hShown = TimerInit()
 	GUISetState(@SW_SHOW, $g_hMain)
-	GUISetState(@SW_RESTORE, $g_hMain)
+	If BitAND(WinGetState($g_hMain), 16) Then GUISetState(@SW_RESTORE, $g_hMain) ; only if really minimized
 	WinActivate($g_hMain)
 	$g_bWinVisible = True
 	_UiRefresh()
 EndFunc   ;==>_WinShow
-Func _WinHide()
+Func _WinHide($sWhy = "")
+	If $g_bWine And $sWhy <> "" Then _Log("Window hidden by: " & $sWhy)
 	GUISetState(@SW_HIDE, $g_hMain)
 	$g_bWinVisible = False
 EndFunc   ;==>_WinHide
@@ -628,6 +776,8 @@ Func _UiTick()
 	Local $s
 	If $g_bPaused Then
 		$s = "paused"
+	ElseIf $g_bBusy Then
+		$s = "updating..."
 	Else
 		Local $iLeft = Round($g_iInterval - TimerDiff($g_hPoll) / 1000)
 		If $iLeft < 0 Then $iLeft = 0
@@ -635,8 +785,11 @@ Func _UiTick()
 	EndIf
 	_SetTxt($g_idNext, $s)
 	If $g_bOnline And _Has($g_iUptime) Then _SetTxt($g_idUpt, _FmtUptime($g_iUptime + Int(TimerDiff($g_hUptime) / 1000)))
+	_SetTxt($g_idMonUpt, _FmtUptime(Int(TimerDiff($g_hStart) / 1000)))
 	If $g_iSsh <> 0 And $g_hSshAge <> 0 Then
-		_SetTxt($g_idSsh, "open (" & _FmtAge(TimerDiff($g_hSshAge)) & ")")
+		Local $sVia = "SSH"
+		If $g_iSsh < 0 Then $sVia = "Telnet"
+		_SetTxt($g_idSsh, $sVia & " open (" & _FmtAge(TimerDiff($g_hSshAge)) & ")")
 	Else
 		_SetTxt($g_idSsh, "closed")
 	EndIf
@@ -654,6 +807,8 @@ Func _UiRefresh()
 	_SetTxt($g_idUp, _FmtVal($g_vUp, "Mbit/s"))
 	_SetTxt($g_idSnrD, _FmtVal($g_vSnrD, "dB"))
 	_SetTxt($g_idSnrU, _FmtVal($g_vSnrU, "dB"))
+	_SetTxt($g_idAttD, _FmtVal($g_vAttD, "Mbit/s"))
+	_SetTxt($g_idAttU, _FmtVal($g_vAttU, "Mbit/s"))
 	_SetTxt($g_idMode, _Dash($g_sMode))
 	_SetTxt($g_idProf, _Dash($g_sProfile))
 	_SetTxt($g_idAnnex, _Dash($g_sAnnex))
@@ -736,9 +891,9 @@ Func _GfxText($hCtx, $sText, $nX, $nY, $hFont, $hFmt, $hBrush)
 EndFunc   ;==>_GfxText
 ; $iCol = history column of the first series, the second series is $iCol + 1
 Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
-	Local Const $W = 556, $H = 150, $L = 44, $R = 10, $T = 24, $B = 20
+	Local Const $W = 556, $h = 150, $L = 44, $R = 10, $T = 24, $B = 20
 	Local Const $CLR_A = 0xFF39FF88, $CLR_B = 0xFFFF4FD8 ; neon green / magenta
-	Local $hBmp = _GDIPlus_BitmapCreateFromScan0($W, $H)
+	Local $hBmp = _GDIPlus_BitmapCreateFromScan0($W, $h)
 	Local $hCtx = _GDIPlus_ImageGetGraphicsContext($hBmp)
 	_GDIPlus_GraphicsSetSmoothingMode($hCtx, 2)
 	_GDIPlus_GraphicsClear($hCtx, 0xFF15181E)
@@ -767,7 +922,7 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 		Next
 	Next
 	If $fMax < $fMin Then
-		_GfxText($hCtx, "waiting for data...", $L + 10, $H / 2 - 6, $hFont, $hFmt, $hBrGray)
+		_GfxText($hCtx, "waiting for data...", $L + 10, $h / 2 - 6, $hFont, $hFmt, $hBrGray)
 	Else
 		Local $fPad = ($fMax - $fMin) * 0.1
 		If $fPad < 0.5 Then $fPad = 0.5
@@ -777,13 +932,13 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 		Local $fRange = $fMax - $fMin
 		; grid + y labels
 		For $k = 0 To 3
-			$y = $T + ($H - $T - $B) * $k / 3
+			$y = $T + ($h - $T - $B) * $k / 3
 			_GDIPlus_GraphicsDrawLine($hCtx, $L, $y, $W - $R, $y, $hPenGrid)
 			_GfxText($hCtx, StringFormat("%.1f", $fMax - $fRange * $k / 3), 2, $y - 7, $hFont, $hFmt, $hBrGray)
 		Next
 		; time labels (first / last sample)
-		_GfxText($hCtx, $g_aHist[0][0], $L, $H - $B + 4, $hFont, $hFmt, $hBrGray)
-		_GfxText($hCtx, $g_aHist[$g_iHistN - 1][0], $W - $R - 32, $H - $B + 4, $hFont, $hFmt, $hBrGray)
+		_GfxText($hCtx, $g_aHist[0][0], $L, $h - $B + 4, $hFont, $hFmt, $hBrGray)
+		_GfxText($hCtx, $g_aHist[$g_iHistN - 1][0], $W - $R - 32, $h - $B + 4, $hFont, $hFmt, $hBrGray)
 		; the two series (gaps where the modem was unreachable)
 		Local $fStep = 0
 		If $g_iHistN > 1 Then $fStep = ($W - $L - $R) / ($g_iHistN - 1)
@@ -798,7 +953,7 @@ Func _DrawGraph($idPic, $sTitle, $iCol, $sNameA, $sNameB)
 				$v = $g_aHist[$i][$iCol + $c]
 				If _Has($v) Then
 					$x = $L + $fStep * $i
-					$y = $T + ($H - $T - $B) * ($fMax - $v) / $fRange
+					$y = $T + ($h - $T - $B) * ($fMax - $v) / $fRange
 					If $bPrev Then
 						_GDIPlus_GraphicsDrawLine($hCtx, $xPrev, $yPrev, $x, $y, $hPen)
 					Else
@@ -876,11 +1031,15 @@ Func _ClearLive()
 	$g_vSnrD = ""
 	$g_vSnrU = ""
 	$g_vTarget = ""
+	$g_vAttD = ""
+	$g_vAttU = ""
+	$g_hAtt = 0 ; query the attainable rates again on the next successful poll
 	$g_iUptime = ""
 EndFunc   ;==>_ClearLive
 ; ---------- update cycle ----------
 Func _Update()
 	$g_bUpdating = True
+	$g_bBusy = True
 	_UiHeader()
 	TraySetToolTip($APP_NAME & " - updating...")
 	Local $sRaw = _FetchDslInfo($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink, True, True)
@@ -905,7 +1064,15 @@ Func _Update()
 		Local $vUp = _ToNum(_Field($sRaw, "Upstream Line Rate"), 1000)
 		Local $vSnrDown = _ToNum(_Field($sRaw, "SNR Downstream"), 1)
 		Local $vSnrUp = _ToNum(_Field($sRaw, "SNR Upstream"), 1)
+		Local $vAttD = _ToNum(_StreamCell($sRaw, "Attainable Rate", 1), 1000)
+		Local $vAttU = _ToNum(_StreamCell($sRaw, "Attainable Rate", 2), 1000)
+		If Not $g_bAttRan Then ; not queried this round -> keep the last values
+			$vAttD = $g_vAttD
+			$vAttU = $g_vAttU
+			If Not _Has($vAttD) Then $g_hAtt = 0 ; nothing yet (e.g. after the Test button) -> query on the next poll
+		EndIf
 		Local $vUptime = _UptimeSec(_Field($sRaw, "Line Uptime"))
+		Local $vMonUptime = Int(TimerDiff($g_hStart) / 1000)
 		; 35b settings (read-only): enhance is 0/1, target is a raw number
 		Local $sEnhance = _Field($sRaw, "35b_enhance status")
 		If $sEnhance = "1" Then
@@ -923,7 +1090,9 @@ Func _Update()
 				',"dsl_version":"' & _J(_Field($sRaw, "DSL Version")) & '"' & _
 				',"down":' & _JNum($vDown) & ',"up":' & _JNum($vUp) & _
 				',"snr_down":' & _JNum($vSnrDown) & ',"snr_up":' & _JNum($vSnrUp) & _
+				',"attain_down":' & _JNum($vAttD) & ',"attain_up":' & _JNum($vAttU) & _
 				',"uptime":' & _JNum($vUptime) & _
+				',"monitor_uptime":' & _JNum($vMonUptime) & _
 				',"enhance":"' & $sEnhance & '"' & _
 				',"target":' & _JNum($vTarget) & _
 				',"fw":"' & _J(_Field($sRaw, "Firmware Version")) & '"' & _
@@ -949,6 +1118,12 @@ Func _Update()
 		$g_vUp = $vUp
 		$g_vSnrD = $vSnrDown
 		$g_vSnrU = $vSnrUp
+		$g_vAttD = $vAttD
+		$g_vAttU = $vAttU
+		If $g_bAttRan And Not _Has($vAttD) And Not $g_bAttWarned Then
+			$g_bAttWarned = True
+			_Log("Attainable rates: no 'Attainable Rate' found in the config submenu output - check the Raw tab (section '--- config submenu ---').")
+		EndIf
 		$g_vTarget = $vTarget
 		$g_iUptime = $vUptime
 		$g_hUptime = TimerInit()
@@ -980,6 +1155,7 @@ Func _Update()
 		If Not ($g_sMqttErr == $g_sMqttPrevErr) Then _Log("MQTT error: " & $g_sMqttErr)
 		$g_sMqttPrevErr = $g_sMqttErr
 	EndIf
+	$g_bBusy = False
 	TraySetToolTip(StringLeft($sTip, 127)) ; tray tooltips are limited to 127 chars
 	_UiRefresh()
 EndFunc   ;==>_Update
@@ -1001,7 +1177,7 @@ Func _FetchDslInfo($sHost, $sUser, $sPass, $sPlink, $bExtras = False, $bPersist 
 		; proactively recycle a long-lived session with a clean logout before it
 		; wedges - a stuck-then-hard-killed session is what leaks the modem's slots
 		If $bPersist And $g_iSsh <> 0 And $g_hSshAge <> 0 And TimerDiff($g_hSshAge) > $g_iSshMaxAge Then _SshDrop()
-		If $bPersist And $g_iSsh <> 0 And Not ProcessExists($g_iSsh) Then $g_iSsh = 0 ; session died on its own
+		If $bPersist And $g_iSsh > 0 And Not ProcessExists($g_iSsh) Then $g_iSsh = 0 ; plink session died on its own
 		If $bPersist And $g_iSsh <> 0 Then
 			$iPid = $g_iSsh
 			$bReused = True
@@ -1062,16 +1238,23 @@ EndFunc   ;==>_DownloadPlink
 ; opens plink, does the SSH + CLI login, returns the PID (0 on failure, reason in $g_sSshErr)
 Func _SshOpen($sHost, $sUser, $sPass, $sPlink)
 	$g_sSshErr = ""
-	$sPlink = _ResolvePlink($sPlink)
-	If $sPlink = "" Then
-		$g_sSshErr = "ERROR: plink.exe not found (checked the configured path, PATH and the script folder) and the automatic download failed - check your internet connection or place plink.exe manually"
-		Return 0
-	EndIf
-	Local $sCmd = '"' & $sPlink & '" -ssh -batch -l ' & $sUser & ' -pw "' & $sPass & '" ' & $sHost
-	Local $iPid = Run($sCmd, @ScriptDir, @SW_HIDE, BitOR($STDIN_CHILD, $STDOUT_CHILD, $STDERR_MERGED))
-	If @error Then
-		$g_sSshErr = "ERROR: could not start plink"
-		Return 0
+	Local $iPid
+	If $g_bTelnet Then
+		; built-in Telnet: plain TCP socket, no external program (works under Wine). Handle is NEGATIVE = socket.
+		$iPid = _TelnetConnect($sHost)
+		If $iPid = 0 Then Return 0
+	Else
+		$sPlink = _ResolvePlink($sPlink)
+		If $sPlink = "" Then
+			$g_sSshErr = "ERROR: plink.exe not found (checked the configured path, PATH and the script folder) and the automatic download failed - check your internet connection or place plink.exe manually"
+			Return 0
+		EndIf
+		Local $sCmd = '"' & $sPlink & '" -ssh -batch -l ' & $sUser & ' -pw "' & $sPass & '" ' & $sHost
+		$iPid = Run($sCmd, @ScriptDir, @SW_HIDE, BitOR($STDIN_CHILD, $STDOUT_CHILD, $STDERR_MERGED))
+		If @error Then
+			$g_sSshErr = "ERROR: could not start plink"
+			Return 0
+		EndIf
 	EndIf
 	Local $sAll = "", $sNew, $aPrompt, $iWait
 	For $i = 1 To 6
@@ -1090,12 +1273,12 @@ Func _SshOpen($sHost, $sUser, $sPass, $sPlink)
 			Return 0
 		EndIf
 		; modem CLI has its own Username:/Password: prompts after the SSH login
-		$aPrompt = StringRegExp(StringLower(StringStripWS($sNew, 2)), "(username|password):$", 1)
+		$aPrompt = StringRegExp(StringLower(StringStripWS($sNew, 2)), "(username|account|login|password):$", 1)
 		If @error Then Return $iPid ; no more prompts -> logged in at the CLI
-		If $aPrompt[0] = "username" Then
-			StdinWrite($iPid, $sUser & @CR)
+		If $aPrompt[0] = "password" Then
+			_IoWrite($iPid, $sPass & @CR)
 		Else
-			StdinWrite($iPid, $sPass & @CR)
+			_IoWrite($iPid, $sUser & @CR)
 		EndIf
 	Next
 	_SshClose($iPid)
@@ -1106,15 +1289,39 @@ EndFunc   ;==>_SshOpen
 Func _SshQuery($iPid, $bExtras)
 	Local $sAll = ""
 	_ReadUntilQuiet($iPid, 100, 500, 100) ; throw away leftovers (prompt etc.) from the previous round
-	StdinWrite($iPid, "exec dslinfo" & @CR)
+	_IoWrite($iPid, "exec dslinfo" & @CR)
 	$sAll &= _ReadUntilQuiet($iPid, 1500, 10000, 4000)
 	If $bExtras Then
 		; read-only commands only - never send the setter variants (e.g. "exec dsl_35b_target 2048") from here
 		Local $aExtra[3] = ["exec sysinfo", "exec dsl_35b_enhance status", "exec dsl_35b_target show"]
 		For $c = 0 To UBound($aExtra) - 1
-			StdinWrite($iPid, $aExtra[$c] & @CR)
+			If $aExtra[$c] = "" Then ContinueLoop
+			_IoWrite($iPid, $aExtra[$c] & @CR)
 			$sAll &= _ReadUntilQuiet($iPid, 700, 5000, 3000)
 		Next
+		; attainable rates are only in the config submenu: enter it, dump the JSON, leave it again.
+		; Every step waits for the modem's PROMPT (typing ahead while the CLI switches menus gets swallowed),
+		; and the whole dialogue goes into the raw output so the Raw tab shows exactly what happened.
+		$g_bAttRan = ($g_hAtt = 0 Or TimerDiff($g_hAtt) >= $g_iAttInterval * 1000)
+		If $g_bAttRan Then
+			$g_hAtt = TimerInit()
+			Local $sLast, $sCfgPrompt = "(?i)\(config[^)]*\)>$"
+			_IoWrite($iPid, "config Monitoring DSL_Status Monitoring_DSL_General" & @CR)
+			$sLast = _ReadUntilPrompt($iPid, $sCfgPrompt, 6000)
+			$sAll &= @CRLF & "--- config submenu ---" & @CRLF & $sLast
+			If StringRegExp(StringStripWS($sLast, 2), $sCfgPrompt) Then
+				_IoWrite($iPid, "show all" & @CR)
+				$sLast = _ReadUntilPrompt($iPid, $sCfgPrompt, 40000, True)
+				$sAll &= $sLast
+			EndIf
+			; leave the submenu: "exit" only while the prompt still says (config...), at the top level it would log us out
+			For $c = 1 To 4
+				If Not StringRegExp(StringStripWS($sLast, 2), $sCfgPrompt) Then ExitLoop
+				_IoWrite($iPid, "exit" & @CR)
+				$sLast = _ReadUntilPrompt($iPid, ">$", 4000)
+				$sAll &= $sLast
+			Next
+		EndIf
 	EndIf
 	Return $sAll
 EndFunc   ;==>_SshQuery
@@ -1122,16 +1329,22 @@ EndFunc   ;==>_SshQuery
 ; closes the pipes (plink sees EOF and disconnects properly). Kill is the last resort.
 Func _SshClose($iPid)
 	If $iPid = 0 Then Return
+	If $iPid < 0 Then ; Telnet socket: CLI logout, then close the connection
+		_IoWrite($iPid, "exit" & @CR)
+		_Nap(300)
+		TCPCloseSocket(-$iPid)
+		Return
+	EndIf
 	If ProcessExists($iPid) Then
 		; 1) ask the modem CLI to log out
 		StdinWrite($iPid, "exit" & @CR)
-		Sleep(300)
+		_Nap(300)
 		; 2) close our stdin -> plink sees EOF and sends a proper SSH disconnect.
 		;    This is what actually frees the modem's PTY/SSH slot; a hard kill
 		;    leaves the slot occupied until the modem's own TCP timeout, and over
 		;    days of polling that exhausts the daemon (SSH "dies" after 2-3 days).
 		StdioClose($iPid)
-		ProcessWaitClose($iPid, 8) ; give the clean disconnect time to complete
+		_WaitClose($iPid, 8) ; give the clean disconnect time to complete
 	Else
 		StdioClose($iPid)
 	EndIf
@@ -1143,12 +1356,123 @@ Func _SshDrop()
 	$g_iSsh = 0
 	$g_hSshAge = 0
 EndFunc   ;==>_SshDrop
+; ---------- transport helpers: plink pipes (handle > 0 = PID) or Telnet socket (handle < 0 = -socket) ----------
+Func _TelnetConnect($sHost)
+	Local $sIP = TCPNameToIP($sHost)
+	If $sIP = "" Then
+		$g_sSshErr = "ERROR: cannot resolve " & $sHost
+		Return 0
+	EndIf
+	Local $iSock = TCPConnect($sIP, $g_iTelnetPort)
+	If @error Or $iSock <= 0 Then
+		$g_sSshErr = "ERROR: cannot connect to " & $sIP & ":" & $g_iTelnetPort & " (is Telnet enabled on the modem?)"
+		Return 0
+	EndIf
+	Return -$iSock
+EndFunc   ;==>_TelnetConnect
+Func _IoWrite($h, $s)
+	If $h > 0 Then
+		StdinWrite($h, $s)
+		Return
+	EndIf
+	; Telnet: line ends with CR NUL, text is UTF-8 (never contains 0xFF, so no IAC escaping needed)
+	TCPSend(-$h, Binary("0x" & _HexRaw(StringReplace($s, @CR, "")) & "0D00"))
+EndFunc   ;==>_IoWrite
+; sends the text as is (no line ending), e.g. a single key for the pager
+Func _IoWriteRaw($h, $s)
+	If $h > 0 Then
+		StdinWrite($h, $s)
+	Else
+		TCPSend(-$h, Binary("0x" & _HexRaw($s)))
+	EndIf
+EndFunc   ;==>_IoWriteRaw
+Func _IoRead($h)
+	Local $sData, $iErr
+	If $h > 0 Then
+		$sData = StdoutRead($h)
+	Else
+		$sData = _TelnetRead(-$h)
+	EndIf
+	$iErr = @error
+	Return SetError($iErr, 0, $sData)
+EndFunc   ;==>_IoRead
+; reads what the modem sent, strips Telnet option negotiation (answers every DO with WONT, every WILL with DONT)
+; @error is set when the connection is closed
+Func _TelnetRead($iSock)
+	Local $bRaw = TCPRecv($iSock, 4096, 1)
+	Local $iErr = @error
+	If $iErr Then Return SetError(1, 0, "")
+	Local $n = BinaryLen($bRaw)
+	If $n = 0 Then Return ""
+	Local $sOut = "", $sReply = "", $i = 1, $c, $c2, $c3
+	While $i <= $n
+		$c = Int(BinaryMid($bRaw, $i, 1))
+		If $c <> 255 Then
+			If $c <> 0 Then $sOut &= Chr($c)
+			$i += 1
+			ContinueLoop
+		EndIf
+		If $i + 1 > $n Then ExitLoop
+		$c2 = Int(BinaryMid($bRaw, $i + 1, 1))
+		Switch $c2
+			Case 253, 251 ; DO / WILL
+				If $i + 2 > $n Then ExitLoop
+				$c3 = Int(BinaryMid($bRaw, $i + 2, 1))
+				If $c2 = 253 Then
+					$sReply &= "FFFC" & Hex($c3, 2) ; WONT
+				Else
+					$sReply &= "FFFE" & Hex($c3, 2) ; DONT
+				EndIf
+				$i += 3
+			Case 252, 254 ; WONT / DONT
+				$i += 3
+			Case 250 ; subnegotiation: skip until IAC SE
+				$i += 2
+				While $i < $n
+					If Int(BinaryMid($bRaw, $i, 1)) = 255 And Int(BinaryMid($bRaw, $i + 1, 1)) = 240 Then
+						$i += 2
+						ExitLoop
+					EndIf
+					$i += 1
+				WEnd
+			Case 255 ; escaped data byte 255
+				$sOut &= Chr(255)
+				$i += 2
+			Case Else
+				$i += 2
+		EndSwitch
+	WEnd
+	If $sReply <> "" Then TCPSend($iSock, Binary("0x" & $sReply))
+	Return $sOut
+EndFunc   ;==>_TelnetRead
+; reads until the (right-trimmed) buffer ends with something matching the regex $sPattern (a prompt),
+; or $iMaxMs have passed / the connection closed. Returns everything received.
+; $bPager: the modem CLI pages long output with "--More--" and waits for a key -> answer it with a space
+; and cut the marker (plus the erase characters after it) out of the returned text.
+Func _ReadUntilPrompt($iPid, $sPattern, $iMaxMs, $bPager = False)
+	Local $sBuf = "", $sChunk
+	Local $hTotal = TimerInit()
+	While TimerDiff($hTotal) < $iMaxMs
+		$sChunk = _IoRead($iPid)
+		If $sChunk <> "" Then
+			$sBuf &= $sChunk
+			If StringRegExp(StringStripWS($sBuf, 2), $sPattern) Then ExitLoop
+			If $bPager And StringRegExp(StringStripWS($sBuf, 2), "(?i)--\s*more\s*--$") Then _IoWriteRaw($iPid, " ")
+		ElseIf @error Then
+			ExitLoop
+		EndIf
+		Sleep(30)
+		_Yield()
+	WEnd
+	If $bPager Then $sBuf = StringRegExpReplace($sBuf, "(?i)--\s*more\s*--(?:[ \x08\r]|\x1b\[[0-9;]*[A-Za-z])*", "")
+	Return $sBuf
+EndFunc   ;==>_ReadUntilPrompt
 ; $iFirstMs = max wait for the first byte, afterwards $iQuietMs of silence ends the read
 Func _ReadUntilQuiet($iPid, $iQuietMs, $iMaxMs, $iFirstMs)
 	Local $sBuf = "", $sChunk
 	Local $hTotal = TimerInit(), $hQuiet = TimerInit()
 	While TimerDiff($hTotal) < $iMaxMs
-		$sChunk = StdoutRead($iPid)
+		$sChunk = _IoRead($iPid)
 		If $sChunk <> "" Then
 			$sBuf &= $sChunk
 			$hQuiet = TimerInit()
@@ -1159,7 +1483,8 @@ Func _ReadUntilQuiet($iPid, $iQuietMs, $iMaxMs, $iFirstMs)
 		ElseIf TimerDiff($hQuiet) > $iQuietMs Then
 			ExitLoop
 		EndIf
-		Sleep(50)
+		Sleep(30)
+		_Yield()
 	WEnd
 	Return $sBuf
 EndFunc   ;==>_ReadUntilQuiet
@@ -1169,6 +1494,12 @@ Func _Field($sText, $sKey)
 	If @error Then Return ""
 	Return $a[0]
 EndFunc   ;==>_Field
+; cell of the JSON "Stream_Table" row $sName: $iCol 1 = Downstream, 2 = Upstream ("" if not found)
+Func _StreamCell($sRaw, $sName, $iCol)
+	Local $a = StringRegExp($sRaw, '(?s)"Name":\s*"' & $sName & '",\s*"Downstream":\s*"([^"]*)",\s*"Upstream":\s*"([^"]*)"', 1)
+	If @error Then Return ""
+	Return $a[$iCol - 1]
+EndFunc   ;==>_StreamCell
 Func _ToNum($s, $iDiv)
 	If $s = "" Then Return ""
 	Local $sNum = StringRegExpReplace($s, "[^\d.]", "")
@@ -1200,10 +1531,13 @@ Func _DiscoveryPackets()
 			"'mode':value_json.mode,'profile':value_json.profile,'annex':value_json.annex,'dsl_version':value_json.dsl_version")
 	$s &= _DiscPkt("downstream_rate", "DSL Downstream Rate", "down", "Mbit/s", "data_rate", "measurement", "")
 	$s &= _DiscPkt("upstream_rate", "DSL Upstream Rate", "up", "Mbit/s", "data_rate", "measurement", "")
+	$s &= _DiscPkt("attainable_down", "DSL Attainable Downstream Rate", "attain_down", "Mbit/s", "data_rate", "measurement", "")
+	$s &= _DiscPkt("attainable_up", "DSL Attainable Upstream Rate", "attain_up", "Mbit/s", "data_rate", "measurement", "")
 	$s &= _DiscPkt("snr_downstream", "DSL SNR Downstream", "snr_down", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("snr_upstream", "DSL SNR Upstream", "snr_up", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("uptime", "DSL Line Uptime", "uptime", "s", "duration", "measurement", "")
 	; diagnostic sensors (read-only)
+	$s &= _DiscPkt("monitor_uptime", "DSL Monitor Uptime", "monitor_uptime", "s", "duration", "measurement", "mdi:timer-outline", "", True)
 	$s &= _DiscPkt("35b_enhance", "DSL 35b Enhance", "enhance", "", "", "", "mdi:tune", "", True)
 	$s &= _DiscPkt("35b_target", "DSL 35b Target", "target", "", "", "", "mdi:target", "", True)
 	$s &= _DiscPkt("firmware", "DSL Modem Firmware", "fw", "", "", "", "mdi:chip", _
@@ -1248,8 +1582,8 @@ Func _HexRaw($s)
 EndFunc   ;==>_HexRaw
 ; 2-byte length prefix + UTF-8 bytes
 Func _HexStr($s)
-	Local $H = _HexRaw($s)
-	Return Hex(Int(StringLen($H) / 2), 4) & $H
+	Local $h = _HexRaw($s)
+	Return Hex(Int(StringLen($h) / 2), 4) & $h
 EndFunc   ;==>_HexStr
 ; MQTT variable-length "remaining length"
 Func _RemLen($n)
@@ -1317,6 +1651,7 @@ Func _MqttSession($sPackets, $sHost, $iPort, $sUser, $sPass)
 		$sAck &= StringTrimLeft(TCPRecv($iSock, 4, 1), 2)
 		If @error Then ExitLoop
 		Sleep(20)
+		_Yield()
 	WEnd
 	If $sAck <> "20020000" Then
 		If $sAck = "20020005" Or $sAck = "20020004" Then
@@ -1329,7 +1664,7 @@ Func _MqttSession($sPackets, $sHost, $iPort, $sUser, $sPass)
 	EndIf
 	; PUBLISH + clean DISCONNECT
 	Local $bOk = _SendHex($iSock, $sPackets & "E000")
-	Sleep(200)
+	_Nap(200)
 	TCPCloseSocket($iSock)
 	If Not $bOk Then $g_sMqttErr = "Sending PUBLISH failed"
 	Return $bOk
