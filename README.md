@@ -103,5 +103,8 @@ If you change the base topic or discovery prefix, the HA discovery is sent again
 - The modem's system uptime is not available (no CLI command found so far).
 - MQTT: QoS 0, no TLS.
 
+## Known Bugs
+-History-Graph messed up after update and you watching it...
+
 ## Links
 - Project: <https://github.com/BrAiNeeBug/VigorDSLMonitor>
