@@ -2,7 +2,7 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.4.0.0
+#AutoIt3Wrapper_Res_Fileversion=0.4.1.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -31,7 +31,7 @@
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
-Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.4)"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.4.1)"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
 Global Const $APP_VER = "0.4.0"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
@@ -55,7 +55,6 @@ Global $g_fSnrAlert ; 0 = off
 ; runtime state
 Global $g_bDisc = False, $g_bPaused = False, $g_bRunning = False
 Global $g_sLastRaw = "", $g_sMqttErr = "", $g_sModel = "" ; $g_sModel = model name read from the modem (for the HA device)
-Global $g_idApp, $g_idShow, $g_idExit
 Global $g_hPoll, $g_hTick
 ; persistent SSH session to the modem (PID of plink, 0 = no session)
 Global $g_iSsh = 0, $g_sSshErr = ""
@@ -144,13 +143,7 @@ If $g_bPassErr Then
 			"Please re-enter the passwords in the settings.")
 	If Not _SettingsGui() Then Exit
 EndIf
-; tray menu
-$g_idApp = TrayCreateItem($APP_NAME)
-TrayCreateItem("")
-$g_idShow = TrayCreateItem("Show window")
-TrayItemSetState($g_idShow, $TRAY_DEFAULT)
-TrayCreateItem("")
-$g_idExit = TrayCreateItem("Exit")
+; no tray menu (breaks the double-click on the icon under Wine): double-click the icon to show the window, Exit is in the window
 TraySetToolTip($APP_NAME)
 $g_bRunning = True
 _BuildMainGui()
@@ -208,10 +201,8 @@ EndFunc   ;==>_Exit
 Func _HandleEvents()
 	Local $iMsg = TrayGetMsg()
 	Switch $iMsg
-		Case $g_idShow, $TRAY_EVENT_PRIMARYDOUBLE
+		Case $TRAY_EVENT_PRIMARYDOUBLE
 			_WinShow()
-		Case $g_idExit
-			Return False
 	EndSwitch
 	$iMsg = GUIGetMsg()
 	Switch $iMsg
