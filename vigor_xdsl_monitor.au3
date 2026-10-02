@@ -2,7 +2,7 @@
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
 #AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.4.1.0
+#AutoIt3Wrapper_Res_Fileversion=0.4.2.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -31,9 +31,9 @@
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
-Global Const $APP_NAME = "Vigor-xDSL-Monitor (0.4.1)"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
-Global Const $APP_VER = "0.4.0"
+Global Const $APP_VER = "0.4"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -778,10 +778,12 @@ EndFunc   ;==>_FmtVal
 Func _FmtUptime($i)
 	If Not _Has($i) Then Return "-"
 	$i = Int($i)
-	Local $d = Int($i / 86400)
-	Local $sT = StringFormat("%02d:%02d:%02d", Int(Mod($i, 86400) / 3600), Int(Mod($i, 3600) / 60), Mod($i, 60))
-	If $d > 0 Then Return $d & "d " & $sT
-	Return $sT
+	Local $d = Int($i / 86400), $h = Int(Mod($i, 86400) / 3600), $m = Int(Mod($i, 3600) / 60), $sec = Mod($i, 60)
+	; human readable, starts at the largest non-zero unit: "3d 4h 12m 5s", "12m 5s", "5s"
+	If $d > 0 Then Return $d & "d " & $h & "h " & $m & "m " & $sec & "s"
+	If $h > 0 Then Return $h & "h " & $m & "m " & $sec & "s"
+	If $m > 0 Then Return $m & "m " & $sec & "s"
+	Return $sec & "s"
 EndFunc   ;==>_FmtUptime
 Func _FmtAge($iMs)
 	Local $iS = Int($iMs / 1000)
@@ -1232,6 +1234,7 @@ Func _Update()
 				',"snr_down":' & _JNum($vSnrDown) & ',"snr_up":' & _JNum($vSnrUp) & _
 				',"attain_down":' & _JNum($vAttD) & ',"attain_up":' & _JNum($vAttU) & _
 				',"uptime":' & _JNum($vUptime) & _
+				',"uptime_text":"' & _J(_FmtUptime($vUptime)) & '"' & _
 				',"enhance":"' & $sEnhance & '"' & _
 				',"target":' & _JNum($vTarget) & _
 				',"fw":"' & _J(_Field($sRaw, "Firmware Version")) & '"' & _
@@ -1760,6 +1763,7 @@ Func _DiscoveryPackets()
 	$s &= _DiscPkt("snr_downstream", "DSL SNR Downstream", "snr_down", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("snr_upstream", "DSL SNR Upstream", "snr_up", "dB", "", "measurement", "mdi:sine-wave")
 	$s &= _DiscPkt("uptime", "DSL Line Uptime", "uptime", "s", "duration", "measurement", "")
+	$s &= _DiscPkt("uptime_text", "DSL Line Uptime (text)", "uptime_text", "", "", "", "mdi:timer-outline")
 	; clean-up: empty retained payload removes the old "DSL Modem Uptime" entity (feature was dropped) from HA
 	$s &= _Pkt($g_sDiscPrefix & "/sensor/vigor_xdsl/modem_uptime/config", "")
 	; monitor uptime is GUI only now: remove the old entity from HA
