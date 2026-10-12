@@ -1,6 +1,8 @@
 # Vigor-xDSL-Monitor
 
 Small Windows tray tool (AutoIt3) for **DrayTek Vigor** xDSL modems. It reads DSL status via the modem CLI and publishes it to **Home Assistant via MQTT** with auto-discovery. A local status window provides graphs, logs and diagnostics.
+<img width="603" height="517" alt="image" src="https://github.com/user-attachments/assets/44406cdf-35ab-4be3-a238-583082e7974b" />
+
 
 Developed and tested with a **Vigor167**, firmware 5.2.9. Other Vigor models using the same CLI may work as well.
 
