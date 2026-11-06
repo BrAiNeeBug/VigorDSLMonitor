@@ -1,8 +1,7 @@
-#Region ;**** Directives created by AutoIt3Wrapper_GUI ****
+#Region
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
-#AutoIt3Wrapper_UseUpx=y
-#AutoIt3Wrapper_Res_Fileversion=0.4.2.0
+#AutoIt3Wrapper_Res_Fileversion=0.6.0.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -14,7 +13,7 @@
 #Tidy_Parameters=/rel
 #AutoIt3Wrapper_Run_Au3Stripper=y
 #Au3Stripper_Parameters=/so /rm
-#EndRegion ;**** Directives created by AutoIt3Wrapper_GUI ****
+#EndRegion
 #include-once
 #include <AutoItConstants.au3>
 #include <TrayConstants.au3>
@@ -31,9 +30,9 @@
 If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
-Global Const $APP_NAME = "Vigor-xDSL-Monitor"
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
-Global Const $APP_VER = "0.4"
+Global Const $APP_VER = "0.6"
+Global Const $APP_NAME = "Vigor-xDSL-Monitor " & "(" & $APP_VER & ")"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
 Global Const $RUN_KEY = "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -119,6 +118,16 @@ Global $g_aFeatId[4], $g_aExtId[20][2], $g_aStrId[3], $g_idPwr, $g_idVidR, $g_id
 Global $g_idGrRate, $g_idGrSnr
 Global $g_idLog = 0, $g_idRawEdit, $g_sRawShown = "", $g_idBtnClear
 Global $g_idBtnNow, $g_idBtnPause, $g_idBtnSet, $g_idBtnHide, $g_idBtnExit
+; "Modem" tab (change settings on the modem)
+Global $g_idMdmEnh, $g_idMdmEnhNow, $g_idMdmTgt, $g_idMdmTgtNow, $g_idMdmSld, $g_idMdmCmd, $g_idMdmOut
+; captions under the 35b target slider (left = 0, right = 32767) - edit them to what the values really do
+Global Const $TGT_LOW_TXT = "0 = modem default"
+Global Const $TGT_HIGH_TXT = "32767 = maximum"
+Global Const $TGT_MID_TXT = "<< speed  |  stable >>" ; centered between the two (target = SNR margin: higher = more margin = more stable, less speed)
+Global $g_idBtnMdmRead, $g_idBtnMdmApply, $g_idBtnMdmSend, $g_idBtnMdmHelp, $g_idBtnMdmReboot
+Global $g_iLastMsg = 0 ; last GUI message handled: while the GUI is busy (slider drag, ...) the loops skip their Sleep
+Global $g_sSldWrote = "" ; last value the target slider wrote into the input (tells "slider moved" from "value typed")
+Global $g_bMdmFilled = False ; the input fields were pre-filled with the values read from the modem
 ; take over an INI from an older version once, this could be removed after some udpates!!!
 If Not FileExists($INI_FILE) Then
 	If FileExists(@ScriptDir & "\vigor_xdsl.ini") Then
@@ -166,6 +175,16 @@ While True
 				_TogglePause()
 			Case $g_idBtnSet
 				_DoSettings()
+			Case $g_idBtnMdmRead
+				_MdmRead()
+			Case $g_idBtnMdmApply
+				_MdmApply()
+			Case $g_idBtnMdmSend
+				_MdmSend()
+			Case $g_idBtnMdmHelp
+				_MdmHelp()
+			Case $g_idBtnMdmReboot
+				_MdmReboot()
 		EndSwitch
 	EndIf
 	If Not $g_bPaused And TimerDiff($g_hPoll) >= $g_iInterval * 1000 Then
@@ -177,10 +196,12 @@ While True
 		$g_hTick = TimerInit()
 	EndIf
 	; idle: short sleep while the window is open, longer while it sits in the tray (saves CPU)
-	If $g_bWinVisible Then
-		Sleep(30)
-	Else
-		Sleep(150)
+	If $g_iLastMsg = 0 Then
+		If $g_bWinVisible Then
+			Sleep(30)
+		Else
+			Sleep(150)
+		EndIf
 	EndIf
 WEnd
 Exit
@@ -205,6 +226,7 @@ Func _HandleEvents()
 			_WinShow()
 	EndSwitch
 	$iMsg = GUIGetMsg()
+	$g_iLastMsg = $iMsg
 	Switch $iMsg
 		Case 0
 			; nothing
@@ -221,7 +243,7 @@ Func _HandleEvents()
 			If $g_bHideOnClose And Not _JustShown("minimize") Then
 				If BitAND(WinGetState($g_hMain), 16) Then _WinHide("minimize")
 			EndIf
-		Case $g_idBtnNow, $g_idBtnPause, $g_idBtnSet
+		Case $g_idBtnNow, $g_idBtnPause, $g_idBtnSet, $g_idBtnMdmRead, $g_idBtnMdmApply, $g_idBtnMdmSend, $g_idBtnMdmHelp, $g_idBtnMdmReboot
 			$g_iReq = $iMsg
 		Case $g_idBtnHide
 			_WinHide("Hide button")
@@ -230,6 +252,12 @@ Func _HandleEvents()
 			GUICtrlSetData($g_idLog, "")
 		Case $g_idLnk
 			ShellExecute($APP_URL)
+		Case $g_idMdmSld
+			Local $sSld = String(GUICtrlRead($g_idMdmSld))
+			If $sSld <> $g_sSldWrote Then
+				$g_sSldWrote = $sSld
+				GUICtrlSetData($g_idMdmTgt, $sSld)
+			EndIf
 		Case $g_idBtnExit
 			Return False
 	EndSwitch
@@ -259,7 +287,7 @@ Func _Nap($iMs)
 	Local $h = TimerInit()
 	Do
 		_Yield()
-		Sleep(20)
+		If $g_iLastMsg = 0 Then Sleep(20)
 	Until TimerDiff($h) >= $iMs
 EndFunc   ;==>_Nap
 ; like ProcessWaitClose, but keeps the GUI alive
@@ -693,6 +721,38 @@ Func _BuildMainGui()
 		$g_aExtId[$i][1] = GUICtrlCreateLabel("-", 505, 142 + 17 * ($i - 4), 70, 17)
 	Next
 	GUICtrlCreateGroup("", -99, -99, 1, 1)
+	; --- modem settings (writes to the modem, always asks first)
+	GUICtrlCreateTabItem("Modem")
+	GUICtrlCreateGroup("VDSL2 35b (Supervectoring)", 20, 102, 560, 134)
+	GUICtrlCreateLabel("35b enhance", 32, 128, 90, 18)
+	$g_idMdmEnh = GUICtrlCreateCombo("", 125, 125, 110, 22, $CBS_DROPDOWNLIST)
+	GUICtrlSetData($g_idMdmEnh, "Enabled|Disabled", "Enabled")
+	GUICtrlCreateLabel("now:", 246, 128, 30, 18)
+	$g_idMdmEnhNow = GUICtrlCreateLabel("-", 278, 128, 100, 18)
+	GUICtrlCreateLabel("35b target", 32, 160, 90, 18)
+	$g_idMdmTgt = GUICtrlCreateInput("", 125, 157, 70, 22, $ES_NUMBER)
+	GUICtrlCreateLabel("now:", 246, 160, 30, 18)
+	$g_idMdmTgtNow = GUICtrlCreateLabel("-", 278, 160, 100, 18)
+	$g_idMdmSld = GUICtrlCreateSlider(32, 182, 360, 30)
+	GUICtrlSetLimit($g_idMdmSld, 32767, 0)
+	GUICtrlSendMsg($g_idMdmSld, 0x414, 4096, 0) ; TBM_SETTICKFREQ
+	GUICtrlSendMsg($g_idMdmSld, 0x415, 0, 1024) ; TBM_SETPAGESIZE (PageUp/PageDown, click next to the knob)
+	GUICtrlSendMsg($g_idMdmSld, 0x417, 0, 1) ; TBM_SETLINESIZE (arrow keys)
+	GUICtrlSetColor(GUICtrlCreateLabel($TGT_LOW_TXT, 32, 212, 110, 16), 0x666666)
+	GUICtrlSetColor(GUICtrlCreateLabel($TGT_MID_TXT, 146, 212, 132, 16, $SS_CENTER), 0x0066CC)
+	GUICtrlSetColor(GUICtrlCreateLabel($TGT_HIGH_TXT, 282, 212, 110, 16, $SS_RIGHT), 0x666666)
+	$g_idBtnMdmRead = GUICtrlCreateButton("Read from modem", 400, 122, 170, 28)
+	$g_idBtnMdmApply = GUICtrlCreateButton("Apply to modem", 400, 156, 170, 28)
+	$g_idBtnMdmReboot = GUICtrlCreateButton("Reboot modem", 400, 190, 170, 28)
+	GUICtrlCreateGroup("", -99, -99, 1, 1)
+	GUICtrlCreateGroup("Modem CLI (one command per line)", 20, 244, 560, 184)
+	$g_idMdmCmd = GUICtrlCreateEdit("", 32, 264, 380, 52, BitOR($ES_WANTRETURN, $WS_VSCROLL, $ES_AUTOVSCROLL))
+	GUICtrlSetFont($g_idMdmCmd, 9, 400, 0, "Consolas")
+	$g_idBtnMdmSend = GUICtrlCreateButton("Send", 424, 264, 146, 26)
+	$g_idBtnMdmHelp = GUICtrlCreateButton("Show CLI help", 424, 292, 146, 26)
+	$g_idMdmOut = GUICtrlCreateEdit("", 32, 324, 538, 96, BitOR($ES_READONLY, $WS_VSCROLL, $ES_AUTOVSCROLL))
+	GUICtrlSetFont($g_idMdmOut, 9, 400, 0, "Consolas")
+	GUICtrlCreateGroup("", -99, -99, 1, 1)
 	; --- details (firmware / device info from sysinfo)
 	GUICtrlCreateTabItem("Details")
 	GUICtrlCreateGroup("Modem / firmware", 20, 102, 560, 326)
@@ -821,6 +881,12 @@ EndFunc   ;==>_UiHeader
 Func _UiTick()
 	If Not $g_bWinVisible Then Return
 	Local $s
+	; a value typed into the target field moves the slider (not while the slider itself wrote that value)
+	Local $sTyped = GUICtrlRead($g_idMdmTgt)
+	If $sTyped <> $g_sSldWrote And StringRegExp($sTyped, "^\d{1,5}$") And Int($sTyped) <= 32767 Then
+		GUICtrlSetData($g_idMdmSld, Int($sTyped))
+		$g_sSldWrote = $sTyped
+	EndIf
 	If $g_bPaused Then
 		$s = "paused"
 	ElseIf $g_bBusy Then
@@ -874,6 +940,9 @@ Func _UiRefresh()
 	_SetTxt($g_idDslV, _Dash($g_sDslVer))
 	_SetTxt($g_idEnh, _Dash($g_sEnhance))
 	_SetTxt($g_idTgt, _Dash($g_vTarget))
+	_SetTxt($g_idMdmEnhNow, _Dash($g_sEnhance))
+	_SetTxt($g_idMdmTgtNow, _Dash($g_vTarget))
+	If Not $g_bMdmFilled And ($g_sEnhance = "enabled" Or $g_sEnhance = "disabled" Or _Has($g_vTarget)) Then _MdmFill()
 	For $i = 0 To 9
 		_SetTxt($g_aFwId[$i], _Dash($g_aFw[$i]))
 	Next
@@ -1216,14 +1285,7 @@ Func _Update()
 		If Not $g_bExtHave And $g_iExtFail < 3 Then $g_hExt = 0
 		Local $vUptime = _UptimeSec(_Field($sRaw, "Line Uptime"))
 		; 35b settings (read-only): enhance is 0/1, target is a raw number
-		Local $sEnhance = _Field($sRaw, "35b_enhance status")
-		If $sEnhance = "1" Then
-			$sEnhance = "enabled"
-		ElseIf $sEnhance = "0" Then
-			$sEnhance = "disabled"
-		Else
-			$sEnhance = "unknown"
-		EndIf
+		Local $sEnhance = _EnhanceText(_Field($sRaw, "35b_enhance status"))
 		Local $vTarget = _ToNum(_Field($sRaw, "35b_target"), 1)
 		Local $sJson = '{"status":"' & _J($sStatus) & '"' & _
 				',"mode":"' & _J(_Field($sRaw, "Mode")) & '"' & _
@@ -1307,6 +1369,233 @@ Func _TipHead()
 	If $g_sModel <> "" Then Return $g_sModel
 	Return $APP_NAME
 EndFunc   ;==>_TipHead
+; ---------- modem settings tab ----------
+; "1" / "0" from 'exec dsl_35b_enhance status' -> enabled / disabled / unknown
+Func _EnhanceText($s)
+	If $s = "1" Then Return "enabled"
+	If $s = "0" Then Return "disabled"
+	Return "unknown"
+EndFunc   ;==>_EnhanceText
+; pre-fills the Modem tab inputs with the values read from the modem (once, never overwrites what you typed later)
+Func _MdmFill()
+	If $g_sEnhance = "enabled" Then GUICtrlSetData($g_idMdmEnh, "Enabled")
+	If $g_sEnhance = "disabled" Then GUICtrlSetData($g_idMdmEnh, "Disabled")
+	If _Has($g_vTarget) Then
+		GUICtrlSetData($g_idMdmTgt, Int($g_vTarget))
+		GUICtrlSetData($g_idMdmSld, Int($g_vTarget))
+		$g_sSldWrote = String(Int($g_vTarget))
+	EndIf
+	$g_bMdmFilled = True
+EndFunc   ;==>_MdmFill
+; output box: strips terminal escape codes, shows the text
+Func _MdmOut($s)
+	$s = StringRegExpReplace($s, "\x1b\[[0-9;?]*[A-Za-z]", "")
+	$s = StringReplace(StringReplace(StringStripCR($s), Chr(8), ""), @LF, @CRLF)
+	If StringLen($s) > 60000 Then $s = StringLeft($s, 60000) & @CRLF & "... (cut)"
+	GUICtrlSetData($g_idMdmOut, $s)
+EndFunc   ;==>_MdmOut
+; buttons off + GUI kept alive (_Yield) while a modem job runs
+Func _MdmBusy($bOn)
+	Local $iState = $GUI_ENABLE
+	If $bOn Then $iState = $GUI_DISABLE
+	GUICtrlSetState($g_idBtnMdmRead, $iState)
+	GUICtrlSetState($g_idBtnMdmApply, $iState)
+	GUICtrlSetState($g_idBtnMdmSend, $iState)
+	GUICtrlSetState($g_idBtnMdmHelp, $iState)
+	GUICtrlSetState($g_idBtnMdmReboot, $iState)
+	$g_bBusy = $bOn
+	If $bOn Then
+		_MdmOut("Working ...")
+	ElseIf $g_bPaused Then
+		_SshDrop() ; polling is paused -> don't keep the modem's SSH slot
+	EndIf
+EndFunc   ;==>_MdmBusy
+; reuses the persistent session of the poll cycle or opens one (0 = failed, reason in $g_sSshErr)
+Func _MdmOpen()
+	If $g_iSsh > 0 And Not ProcessExists($g_iSsh) Then $g_iSsh = 0 ; plink session died on its own
+	If $g_iSsh = 0 Then
+		Local $iPid = _SshOpen($g_sModemHost, $g_sModemUser, $g_sModemPass, $g_sPlink)
+		If $iPid = 0 Then Return 0
+		$g_iSsh = $iPid
+		$g_hSshAge = TimerInit()
+		$g_hExt = 0 ; fresh session -> the next poll reads the extended data again
+	EndIf
+	Return $g_iSsh
+EndFunc   ;==>_MdmOpen
+; sends the lines one by one and waits for the CLI prompt after each one (pager answered). Returns the whole dialogue.
+; A config submenu that is still open at the end is left again, so the poll cycle finds the top level.
+Func _MdmRun($iPid, $sLines)
+	Local $aL = StringSplit(StringStripCR($sLines), @LF, 2)
+	Local $sAll = "", $sOut = "", $sCmd, $sCfg = "(?i)\(config[^)]*\)>$"
+	For $i = 0 To UBound($aL) - 1
+		$sCmd = StringStripWS($aL[$i], 3)
+		If $sCmd = "" Then ContinueLoop
+		_ReadUntilQuiet($iPid, 100, 500, 100) ; throw away leftovers
+		_IoWrite($iPid, $sCmd & @CR)
+		$sOut = _ReadUntilPrompt($iPid, "(?i)(>|\[y/n\]\??)$", 25000, True) ; CLI prompt or a [y/n] question
+		$sAll &= ">>> " & $sCmd & @CRLF & $sOut & @CRLF
+	Next
+	For $c = 1 To 4
+		If Not StringRegExp(StringStripWS($sOut, 2), $sCfg) Then ExitLoop
+		_IoWrite($iPid, "exit" & @CR)
+		$sOut = _ReadUntilPrompt($iPid, ">$", 4000)
+		$sAll &= $sOut
+	Next
+	Return $sAll
+EndFunc   ;==>_MdmRun
+; opens the session, runs the lines, shows the output. Returns the output ("" if there was no session).
+Func _MdmExec($sLines)
+	_MdmBusy(True)
+	Local $sOut = "", $iPid = _MdmOpen()
+	If $iPid = 0 Then
+		_MdmOut($g_sSshErr)
+		_Log("Modem tab: no connection - " & _FirstLine($g_sSshErr))
+	Else
+		$sOut = _MdmRun($iPid, $sLines)
+		_MdmOut($sOut)
+	EndIf
+	_MdmBusy(False)
+	Return $sOut
+EndFunc   ;==>_MdmExec
+; takes enhance / target out of a CLI dialogue and keeps them as the current values
+Func _MdmStore($sRaw)
+	Local $sE = _EnhanceText(_Field($sRaw, "35b_enhance status"))
+	Local $vT = _ToNum(_Field($sRaw, "35b_target"), 1)
+	If $sE <> "unknown" Then $g_sEnhance = $sE
+	If _Has($vT) Then $g_vTarget = $vT
+	Return ($sE <> "unknown" Or _Has($vT))
+EndFunc   ;==>_MdmStore
+Func _MdmRead()
+	Local $sOut = _MdmExec("exec dsl_35b_enhance status" & @LF & "exec dsl_35b_target show")
+	If $sOut = "" Then Return
+	If _MdmStore($sOut) Then
+		_MdmFill()
+		_UiRefresh()
+		_Log("Modem tab: read 35b enhance = " & $g_sEnhance & ", target = " & $g_vTarget)
+	Else
+		_Log("Modem tab: could not read the 35b values (see the output on the Modem tab)")
+	EndIf
+EndFunc   ;==>_MdmRead
+; sets what differs from the current values, then reads it back from the modem to check that it really changed.
+; Syntax (from the modem's own usage text): exec dsl_35b_enhance 0|1|status, exec dsl_35b_target 0~32767|show.
+; Can be overridden in the INI, section [modem_cmd]: enhance_on / enhance_off (several commands separated by |
+; are tried until the read-back matches), target_set = command with %v for the value.
+Func _MdmApply()
+	Local $sWantE = StringLower(GUICtrlRead($g_idMdmEnh)) ; enabled / disabled
+	Local $sTgt = StringStripWS(GUICtrlRead($g_idMdmTgt), 3)
+	If $sTgt <> "" And (Not StringRegExp($sTgt, "^\d{1,5}$") Or Number($sTgt) > 32767) Then
+		MsgBox($MB_ICONWARNING, "Modem settings", "35b target must be a whole number from 0 to 32767.", 0, $g_hMain)
+		Return
+	EndIf
+	Local $bE = ($sWantE <> $g_sEnhance)
+	Local $bT = ($sTgt <> "" And (Not _Has($g_vTarget) Or Number($sTgt) <> Number($g_vTarget)))
+	If Not $bE And Not $bT Then
+		MsgBox($MB_ICONINFORMATION, "Modem settings", "Nothing to change - the modem already has these values." & @CRLF & "(Use 'Read from modem' if you are not sure about the current values.)", 0, $g_hMain)
+		Return
+	EndIf
+	Local $sMsg = "This will be sent to the modem:" & @CRLF & @CRLF
+	If $bE Then $sMsg &= "   35b enhance  ->  " & $sWantE & @CRLF
+	If $bT Then $sMsg &= "   35b target   ->  " & $sTgt & @CRLF
+	If $bE Then $sMsg &= @CRLF & "Changing 35b enhance re-syncs the line (short connection loss)." & @CRLF
+	$sMsg &= @CRLF & "Continue?"
+	If MsgBox($MB_YESNO + $MB_ICONQUESTION, "Modem settings", $sMsg, 0, $g_hMain) <> $IDYES Then Return
+	_MdmBusy(True)
+	Local $iPid = _MdmOpen()
+	If $iPid = 0 Then
+		_MdmOut($g_sSshErr)
+		_Log("Modem tab: no connection - " & _FirstLine($g_sSshErr))
+		_MdmBusy(False)
+		Return
+	EndIf
+	Local $sAll = "", $sRes = "", $sChk, $aC, $sDef, $bOk
+	If $bE Then
+		If $sWantE = "enabled" Then
+			$sDef = IniRead($INI_FILE, "modem_cmd", "enhance_on", "exec dsl_35b_enhance 1")
+		Else
+			$sDef = IniRead($INI_FILE, "modem_cmd", "enhance_off", "exec dsl_35b_enhance 0")
+		EndIf
+		$aC = StringSplit($sDef, "|", 2)
+		$bOk = False
+		For $i = 0 To UBound($aC) - 1
+			$sAll &= _MdmRun($iPid, $aC[$i])
+			$sChk = _MdmRun($iPid, "exec dsl_35b_enhance status")
+			$sAll &= $sChk
+			If _EnhanceText(_Field($sChk, "35b_enhance status")) = $sWantE Then
+				$bOk = True
+				$g_sEnhance = $sWantE
+				ExitLoop
+			EndIf
+		Next
+		If $bOk Then
+			$sRes &= "35b enhance: now " & $sWantE & " (confirmed by read-back)" & @CRLF
+		Else
+			$sRes &= "35b enhance: NOT confirmed - the modem still reports '" & _EnhanceText(_Field($sChk, "35b_enhance status")) & "'. Check the dialogue below or use 'Show CLI help'." & @CRLF
+		EndIf
+	EndIf
+	If $bT Then
+		$sDef = StringReplace(IniRead($INI_FILE, "modem_cmd", "target_set", "exec dsl_35b_target %v"), "%v", $sTgt)
+		$sAll &= _MdmRun($iPid, $sDef)
+		$sChk = _MdmRun($iPid, "exec dsl_35b_target show")
+		$sAll &= $sChk
+		Local $vT = _ToNum(_Field($sChk, "35b_target"), 1)
+		If _Has($vT) And Number($vT) = Number($sTgt) Then
+			$g_vTarget = $vT
+			$sRes &= "35b target: now " & $vT & " (confirmed by read-back)" & @CRLF
+		Else
+			$sRes &= "35b target: NOT confirmed - the modem reports '" & _Dash($vT) & "'. Check the dialogue below." & @CRLF
+		EndIf
+	EndIf
+	_MdmOut($sRes & @CRLF & $sAll)
+	_Log("Modem tab: " & StringReplace(StringStripWS($sRes, 2), @CRLF, " | "))
+	_MdmBusy(False)
+	_UiRefresh()
+EndFunc   ;==>_MdmApply
+; reboots the modem: "exec reboot_system 0", answers the [y/n] question with y, then lets go of the session.
+; The poll cycle fails for a while and picks the modem up again by itself after the reboot.
+Func _MdmRebootRun($iPid)
+	Local $sOut = ">>> exec reboot_system 0" & @CRLF, $sAsk
+	_ReadUntilQuiet($iPid, 100, 500, 100)
+	_IoWrite($iPid, "exec reboot_system 0" & @CR)
+	$sAsk = _ReadUntilPrompt($iPid, "(?i)\[y/n\]\??$", 8000)
+	$sOut &= $sAsk & @CRLF
+	If StringRegExp(StringStripWS($sAsk, 2), "(?i)\[y/n\]\??$") Then
+		_IoWrite($iPid, "y" & @CR)
+		$sOut &= ">>> y" & @CRLF & _ReadUntilQuiet($iPid, 1500, 6000, 3000)
+		_Log("Modem tab: reboot sent - the modem goes down, polling continues by itself afterwards")
+	Else
+		_Log("Modem tab: reboot - the [y/n] question did not show up, nothing was rebooted (see the output)")
+	EndIf
+	_SshDrop()
+	Return $sOut
+EndFunc   ;==>_MdmRebootRun
+Func _MdmReboot()
+	If MsgBox($MB_YESNO + $MB_ICONQUESTION, "Modem", "Reboot the modem now (exec reboot_system 0)?" & @CRLF & @CRLF & _
+			"The modem restarts completely, the line drops and re-syncs. This takes a minute or two.", 0, $g_hMain) <> $IDYES Then Return
+	_MdmBusy(True)
+	Local $iPid = _MdmOpen()
+	If $iPid = 0 Then
+		_MdmOut($g_sSshErr)
+		_Log("Modem tab: no connection - " & _FirstLine($g_sSshErr))
+	Else
+		_MdmOut(_MdmRebootRun($iPid))
+	EndIf
+	_MdmBusy(False)
+EndFunc   ;==>_MdmReboot
+Func _MdmSend()
+	Local $sLines = GUICtrlRead($g_idMdmCmd)
+	If StringStripWS($sLines, 8) = "" Then Return
+	If StringRegExp($sLines, "(?i)reboot") Then
+		If MsgBox($MB_YESNO + $MB_ICONWARNING, "Modem CLI", "This looks like a modem reboot. Really send it?", 0, $g_hMain) <> $IDYES Then Return
+	EndIf
+	_MdmExec($sLines)
+	_Log("Modem tab: sent " & UBound(StringSplit(StringStripCR($sLines), @LF, 2)) & " CLI line(s)")
+EndFunc   ;==>_MdmSend
+; read-only discovery: shows what the modem's CLI offers for the 35b commands and the physical interface settings branch
+Func _MdmHelp()
+	Local $sLines = "exec dsl_35b_enhance ?" & @LF & "exec dsl_35b_target ?" & @LF & "config Configuration Physical_Interface" & @LF & "?" & @LF & "show"
+	GUICtrlSetData($g_idMdmCmd, StringReplace($sLines, @LF, @CRLF))
+	_MdmExec($sLines)
+EndFunc   ;==>_MdmHelp
 ; ---------- modem ----------
 ; Keeps ONE plink/SSH session open between polls (the modem only has a handful of PTYs,
 ; opening + killing a session every poll leaked them until the modem ran out).
