@@ -1,7 +1,7 @@
 #Region
 #AutoIt3Wrapper_Icon=vigor_xdsl_monitor.ico
 #AutoIt3Wrapper_Outfile_x64=vigor_xdsl_monitor.exe
-#AutoIt3Wrapper_Res_Fileversion=0.6.0.0
+#AutoIt3Wrapper_Res_Fileversion=0.7.0.0
 #AutoIt3Wrapper_Res_Fileversion_AutoIncrement=y
 #AutoIt3Wrapper_Res_Language=1033
 #AutoIt3Wrapper_Res_requestedExecutionLevel=None
@@ -31,7 +31,7 @@ If _Singleton(@ScriptName, 1) = 0 Then Exit
 Opt("TrayMenuMode", 3) ; no default items, no auto-check
 Opt("GUICloseOnESC", 0) ; ESC must not hide/close the main window
 Global Const $APP_URL = "https://github.com/BrAiNeeBug/VigorDSLMonitor"
-Global Const $APP_VER = "0.6"
+Global Const $APP_VER = "0.7.0.0"
 Global Const $APP_NAME = "Vigor-xDSL-Monitor " & "(" & $APP_VER & ")"
 Global Const $INI_FILE = @ScriptDir & "\vigor_xdsl_monitor.ini"
 Global Const $CSV_FILE = @ScriptDir & "\vigor_xdsl_monitor.csv"
@@ -108,6 +108,14 @@ Global $g_iReq = 0 ; button pressed (queued), executed by the main loop and neve
 Global $g_hShown = 0 ; timer: window was just shown (Wine fires bogus close/minimize events then)
 Global $g_bWine = False
 Global $g_idLnk = 0
+; update check (GitHub releases, background download, once a day)
+Global Const $UPD_API = "https://api.github.com/repos/BrAiNeeBug/VigorDSLMonitor/releases/latest"
+Global Const $UPD_PAGE = $APP_URL & "/releases/latest"
+Global Const $UPD_EVERY = 24 * 60 * 60 * 1000
+Global $g_bUpdCheck = True ; INI general/check_updates
+Global $g_hUpd = 0, $g_hUpdT = 0, $g_hUpdLast = 0, $g_iUpdWait = 5000 ; first check 5 s after start
+Global $g_bUpdManual = False, $g_sNewVer = ""
+Global $g_idTiAbout = 0, $g_idUpdVal = 0, $g_idUpdLnk = 0, $g_idBtnChk = 0
 Global $g_hGfxFam = 0, $g_hGfxFont = 0, $g_bGfxGeneric = False, $g_bGfxWarned = False ; graph font (created once)
 Global $g_idHdr, $g_idSub, $g_idTab, $g_idTiRaw
 Global $g_idDown, $g_idUp, $g_idSnrD, $g_idSnrU
@@ -161,6 +169,7 @@ If Not $g_bStartHidden Then _WinShow()
 _Update()
 $g_hPoll = TimerInit()
 $g_hTick = TimerInit()
+$g_hUpdLast = TimerInit()
 Local $iReq
 While True
 	If Not _HandleEvents() Then ExitLoop
@@ -193,6 +202,7 @@ While True
 	EndIf
 	If TimerDiff($g_hTick) >= 1000 Then
 		_UiTick()
+		_UpdTick()
 		$g_hTick = TimerInit()
 	EndIf
 	; idle: short sleep while the window is open, longer while it sits in the tray (saves CPU)
@@ -252,6 +262,10 @@ Func _HandleEvents()
 			GUICtrlSetData($g_idLog, "")
 		Case $g_idLnk
 			ShellExecute($APP_URL)
+		Case $g_idUpdLnk
+			ShellExecute($UPD_PAGE)
+		Case $g_idBtnChk
+			_UpdStart(True)
 		Case $g_idMdmSld
 			Local $sSld = String(GUICtrlRead($g_idMdmSld))
 			If $sSld <> $g_sSldWrote Then
@@ -344,6 +358,7 @@ Func _LoadSettings()
 	$g_bCsv = (Int(IniRead($INI_FILE, "general", "csv_log", "0")) <> 0)
 	$g_fSnrAlert = Number(IniRead($INI_FILE, "general", "snr_alert", "0"))
 	If $g_fSnrAlert < 0 Then $g_fSnrAlert = 0
+	$g_bUpdCheck = (Int(IniRead($INI_FILE, "general", "check_updates", "1")) <> 0)
 EndFunc   ;==>_LoadSettings
 ; True when running under Wine (ntdll exports wine_get_version there, real Windows does not)
 Func _IsWine()
@@ -489,6 +504,8 @@ Func _SettingsGui()
 	GUICtrlCreateLabel("min. " & $EXT_MIN_FACTOR & " x interval, max 86400", 198, 263, 195, 18)
 	GUICtrlCreateLabel("Slow query (10+ s): attainable rates, trellis, bitswap, error counters. " & _
 			"It always runs once at start and after a reconnect / resync, otherwise only this often.", 22, 290, 368, 48)
+	Local $iUpd = GUICtrlCreateCheckbox("Check GitHub for a new version (once a day)", 22, 344, 368, 20)
+	If $g_bUpdCheck Then GUICtrlSetState($iUpd, $GUI_CHECKED)
 	; --- alerts
 	GUICtrlCreateTabItem("Alerts")
 	Local $iNotify = GUICtrlCreateCheckbox("Notify on line status change and resync", 22, 48, 360, 20)
@@ -593,6 +610,7 @@ Func _SettingsGui()
 				IniWrite($INI_FILE, "general", "hide_on_close", Int(_Chk($iClose)))
 				IniWrite($INI_FILE, "general", "csv_log", Int(_Chk($iCsv)))
 				IniWrite($INI_FILE, "general", "notify", Int(_Chk($iNotify)))
+				IniWrite($INI_FILE, "general", "check_updates", Int(_Chk($iUpd)))
 				IniWrite($INI_FILE, "general", "snr_alert", Number(GUICtrlRead($iSnr)))
 				_AutostartSet(_Chk($iAuto))
 				_LoadSettings()
@@ -775,7 +793,7 @@ Func _BuildMainGui()
 	$g_idRawEdit = GUICtrlCreateEdit("", 20, 102, 560, 326, BitOR($ES_READONLY, $WS_VSCROLL, $ES_AUTOVSCROLL))
 	GUICtrlSetFont($g_idRawEdit, 9, 400, 0, "Consolas")
 	; --- about
-	GUICtrlCreateTabItem("About")
+	$g_idTiAbout = GUICtrlCreateTabItem("About")
 	Local $idAbT = GUICtrlCreateLabel("Vigor-xDSL-Monitor", 32, 118, 540, 34)
 	GUICtrlSetFont($idAbT, 18, 700, 0, "Segoe UI")
 	GUICtrlCreateLabel("Reads the DSL status of DrayTek Vigor modems (SSH / Telnet) and publishes it to Home Assistant via MQTT.", 32, 158, 540, 36)
@@ -790,6 +808,18 @@ Func _BuildMainGui()
 	GUICtrlSetCursor($g_idLnk, 0) ; hand
 	GUICtrlSetData(_Row("System", 32, 284, 100, 440), _RuntimeInfo())
 	GUICtrlSetData(_Row("AutoIt", 32, 308, 100, 440), @AutoItVersion)
+	$g_idUpdVal = _Row("Update", 32, 340, 100, 330)
+	$g_idBtnChk = GUICtrlCreateButton("Check now", 476, 336, 96, 24)
+	$g_idUpdLnk = GUICtrlCreateLabel("Open the release page to download it", 136, 364, 440, 18)
+	GUICtrlSetColor($g_idUpdLnk, 0x0066CC)
+	GUICtrlSetFont($g_idUpdLnk, 9, 400, 4, "Segoe UI")
+	GUICtrlSetCursor($g_idUpdLnk, 0) ; hand
+	GUICtrlSetState($g_idUpdLnk, $GUI_HIDE)
+	If $g_bUpdCheck Then
+		GUICtrlSetData($g_idUpdVal, "not checked yet")
+	Else
+		GUICtrlSetData($g_idUpdVal, "automatic check is off (Settings > General)")
+	EndIf
 	GUICtrlCreateTabItem("")
 	$g_idBtnNow = GUICtrlCreateButton("Update now", 10, 448, 100, 30)
 	$g_idBtnPause = GUICtrlCreateButton("Pause", 115, 448, 100, 30)
@@ -797,6 +827,89 @@ Func _BuildMainGui()
 	$g_idBtnHide = GUICtrlCreateButton("Hide to tray", 380, 448, 100, 30)
 	$g_idBtnExit = GUICtrlCreateButton("Exit", 490, 448, 100, 30)
 EndFunc   ;==>_BuildMainGui
+; ---------- update check ----------
+; starts the download of the latest release info in the BACKGROUND (never blocks the GUI)
+Func _UpdStart($bManual = False)
+	If $g_hUpd <> 0 Then Return ; already running
+	$g_bUpdManual = $bManual
+	$g_hUpdLast = TimerInit()
+	$g_iUpdWait = $UPD_EVERY
+	$g_hUpd = InetGet($UPD_API, @TempDir & "\vigor_xdsl_update.json", $INET_FORCERELOAD, $INET_DOWNLOADBACKGROUND)
+	If @error Or $g_hUpd = 0 Then
+		$g_hUpd = 0
+		_UpdShow("check failed", False)
+		Return
+	EndIf
+	$g_hUpdT = TimerInit()
+	If $bManual Then _UpdShow("checking...", False)
+EndFunc   ;==>_UpdStart
+; called once per second from the main loop
+Func _UpdTick()
+	If $g_hUpd = 0 Then
+		If $g_bUpdCheck And TimerDiff($g_hUpdLast) >= $g_iUpdWait Then _UpdStart(False)
+		Return
+	EndIf
+	Local $bDone = InetGetInfo($g_hUpd, $INET_DOWNLOADCOMPLETE)
+	If Not $bDone And TimerDiff($g_hUpdT) < 30000 Then Return
+	Local $bOk = $bDone And InetGetInfo($g_hUpd, $INET_DOWNLOADSUCCESS)
+	InetClose($g_hUpd)
+	$g_hUpd = 0
+	Local $sFile = @TempDir & "\vigor_xdsl_update.json"
+	Local $sJson = ""
+	If $bOk Then $sJson = FileRead($sFile)
+	FileDelete($sFile)
+	Local $aTag = StringRegExp($sJson, '"tag_name"\s*:\s*"([^"]+)"', 1)
+	If @error Then
+		_Log("Update check failed")
+		If $g_bUpdManual Then _UpdShow("check failed (no connection to GitHub?)", False)
+		Return
+	EndIf
+	Local $sNew = StringRegExp($aTag[0], "\d+(?:\.\d+)*", 1)
+	If @error Then
+		_Log("Update check: can't read version from tag " & $aTag[0])
+		If $g_bUpdManual Then _UpdShow("check failed (unknown version format)", False)
+		Return
+	EndIf
+	If _VerNewer($sNew[0], $APP_VER) Then
+		If $g_sNewVer <> $sNew[0] Then _Log("New version available: " & $sNew[0] & " (installed: " & $APP_VER & ")")
+		$g_sNewVer = $sNew[0]
+		_UpdShow("NEW VERSION " & $sNew[0] & " available!", True)
+	Else
+		$g_sNewVer = ""
+		_UpdShow("up to date (latest release: " & $sNew[0] & ")", False)
+	EndIf
+EndFunc   ;==>_UpdTick
+; updates the About tab: red text + download link + "About (!)" caption when a new version exists
+Func _UpdShow($sTxt, $bNew)
+	GUICtrlSetData($g_idUpdVal, $sTxt)
+	If $bNew Then
+		GUICtrlSetColor($g_idUpdVal, 0xE00000)
+		GUICtrlSetFont($g_idUpdVal, 9, 700, 0, "Segoe UI")
+		GUICtrlSetState($g_idUpdLnk, $GUI_SHOW)
+		GUICtrlSetData($g_idTiAbout, "About (!)")
+	Else
+		GUICtrlSetColor($g_idUpdVal, 0x000000)
+		GUICtrlSetFont($g_idUpdVal, 9, 400, 0, "Segoe UI")
+		GUICtrlSetState($g_idUpdLnk, $GUI_HIDE)
+		GUICtrlSetData($g_idTiAbout, "About")
+	EndIf
+EndFunc   ;==>_UpdShow
+; True if version $sNew ("0.6.1.0") is newer than $sCur ("0.6.0.0"); missing parts count as 0
+Func _VerNewer($sNew, $sCur)
+	Local $aN = StringSplit($sNew, ".", 2), $aC = StringSplit($sCur, ".", 2)
+	Local $iMax = UBound($aN)
+	If UBound($aC) > $iMax Then $iMax = UBound($aC)
+	Local $iA, $iB
+	For $i = 0 To $iMax - 1
+		$iA = 0
+		$iB = 0
+		If $i < UBound($aN) Then $iA = Int($aN[$i])
+		If $i < UBound($aC) Then $iB = Int($aC[$i])
+		If $iA > $iB Then Return True
+		If $iA < $iB Then Return False
+	Next
+	Return False
+EndFunc   ;==>_VerNewer
 ; OS / Wine info for the About tab (handy for bug reports)
 Func _RuntimeInfo()
 	Local $s = @OSVersion & " " & @OSArch
